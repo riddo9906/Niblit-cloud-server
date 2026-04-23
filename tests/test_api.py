@@ -108,3 +108,106 @@ def test_unknown_model_is_404():
         json={"model": "does-not-exist", "messages": [{"role": "user", "content": "x"}]},
     )
     assert response.status_code == 404
+
+
+# ── Niblit local_brain compatibility tests ────────────────────────────────────
+
+def test_model_alias_local_resolves_to_default():
+    """Niblit QwenLocalBrain always sends model='local'; must map to default."""
+    client, manager = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "local",
+            "messages": [{"role": "user", "content": "niblit local alias"}],
+            "temperature": 0.7,
+            "max_tokens": 200,
+            "stop": ["<|im_end|>"],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["choices"][0]["message"]["content"] == "echo:niblit local alias"
+    assert manager.last_chat_call["model_id"] == "demo-model"
+
+
+def test_health_probe_endpoint():
+    """Niblit _check_server_url probes /health as its first target."""
+    client, _ = make_client()
+    assert client.get("/health").status_code == 200
+    assert client.get("/healthz").status_code == 200
+
+
+def test_props_probe_endpoint():
+    """Niblit _check_server_url probes /props as its legacy fallback target."""
+    client, _ = make_client()
+    response = client.get("/props")
+    assert response.status_code == 200
+    assert "total_slots" in response.json()
+
+
+def test_legacy_completion_endpoint():
+    """Niblit _generate_http_legacy calls POST /completion with prompt+n_predict."""
+    client, manager = make_client()
+    response = client.post(
+        "/completion",
+        json={
+            "prompt": "legacy prompt text",
+            "n_predict": 64,
+            "temperature": 0.7,
+            "stop": ["<|im_end|>"],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["content"] == "echo:legacy prompt text"
+    assert manager.last_chat_call["max_tokens"] == 64
+
+
+def test_chat_completions_request_defaults():
+    """Omitting temperature/max_tokens should use the shared defaults."""
+    client, manager = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "demo-model", "messages": [{"role": "user", "content": "defaults"}]},
+    )
+    assert response.status_code == 200
+    # Default temperature and max_tokens from _DEFAULT_TEMPERATURE / _DEFAULT_MAX_TOKENS
+    assert manager.last_chat_call["temperature"] == 0.2
+    assert manager.last_chat_call["max_tokens"] == 256
+
+
+def test_legacy_completion_request_defaults():
+    """Omitting n_predict/temperature should use the shared defaults."""
+    client, manager = make_client()
+    response = client.post(
+        "/completion",
+        json={"prompt": "default check"},
+    )
+    assert response.status_code == 200
+    assert manager.last_chat_call["temperature"] == 0.2
+    assert manager.last_chat_call["max_tokens"] == 256
+
+
+def test_niblit_full_flow_model_local_stop_tokens():
+    """Full round-trip matching what Niblit's _generate_http() sends."""
+    client, manager = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "local",
+            "messages": [
+                {"role": "system", "content": "You are Niblit."},
+                {"role": "user", "content": "What is 2+2?"},
+            ],
+            "max_tokens": 200,
+            "temperature": 0.7,
+            "stop": ["<|im_end|>", "<|endoftext|>"],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert "choices" in payload
+    assert payload["choices"][0]["message"]["role"] == "assistant"
+    assert manager.last_chat_call["model_id"] == "demo-model"
+    assert manager.last_chat_call["max_tokens"] == 200

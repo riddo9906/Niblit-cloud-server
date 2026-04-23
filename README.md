@@ -8,6 +8,10 @@ Niblit provider logic and other compatible clients.
 
 - Hugging Face-style chat completions endpoint (`/v1/chat/completions`)
 - Hugging Face-style inference endpoint (`/models/{model}`)
+- **Drop-in llama-server replacement** for Niblit's `QwenLocalBrain` HTTP backend
+  - Handles `"model": "local"` alias automatically (Niblit sends this by default)
+  - Responds to all probe endpoints Niblit uses: `GET /health`, `GET /v1/models`, `GET /props`
+  - Supports legacy `POST /completion` endpoint fallback path
 - Multiple compatibility routes for provider URL patterns:
   - `/hf/...`
   - `/local/...`
@@ -28,6 +32,25 @@ pip install -r requirements.txt
 cp .env.example .env
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+## Connecting Niblit to this server
+
+Set the following environment variables in your **Niblit** deployment
+(e.g. Fly.io secrets, Vercel env, or local `.env`):
+
+```bash
+# Point QwenLocalBrain at the cloud server instead of localhost:8080
+NIBLIT_LLAMA_SERVER_URL=https://<your-cloud-server>.fly.dev
+NIBLIT_GGUF_BACKEND=http
+# Optional: increase timeout for cloud inference (default is 120 s)
+NIBLIT_LLAMA_SERVER_TIMEOUT=300
+```
+
+Niblit's `QwenLocalBrain` will then:
+1. Probe `https://<your-cloud-server>/health` → `200 OK` ✅
+2. Call `POST /v1/chat/completions` with `"model": "local"` → handled ✅
+3. Fall back to `POST /completion` if needed → handled ✅
+
 
 ## Configuration
 

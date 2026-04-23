@@ -8,6 +8,15 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+# Niblit's QwenLocalBrain._generate_http() always sends "model": "local" in
+# every request so the cloud server can act as a drop-in llama-server
+# replacement.  Any of these aliases resolves to the configured default model.
+_LOCAL_MODEL_ALIASES: frozenset[str] = frozenset({"local", "llama", "default"})
+
+# Shared defaults for request schemas.
+_DEFAULT_TEMPERATURE: float = 0.2
+_DEFAULT_MAX_TOKENS: int = 256
+
 
 def _load_models_from_env() -> dict[str, str]:
     raw = os.getenv("GGUF_MODELS_JSON", "{}").strip()
@@ -82,6 +91,12 @@ class ModelManager:
         self._n_ctx = int(os.getenv("N_CTX", "4096"))
         self._n_threads = int(os.getenv("N_THREADS", "4"))
 
+    def get_default_model_info(self) -> dict[str, str]:
+        """Return {model_id, model_path} for the default model (empty strings if none)."""
+        model_id = self._default_model or ""
+        model_path = self._model_map.get(model_id, "") if model_id else ""
+        return {"model_id": model_id, "model_path": model_path}
+
     def list_models(self) -> list[dict[str, str]]:
         return [{"id": model_id, "object": "model"} for model_id in self._model_map]
 
@@ -91,10 +106,27 @@ class ModelManager:
         return {"id": model_id, "object": "model"}
 
     def resolve_model_id(self, request_model: str | None, path_model: str | None) -> str:
-        """Resolve model precedence as request model > path model > default model."""
+        """Resolve model precedence as request model > path model > default model.
+
+        The string ``"local"`` (and other well-known aliases set in
+        _LOCAL_MODEL_ALIASES) is mapped to the configured default model so that
+        Niblit's ``QwenLocalBrain`` HTTP backend — which always sends
+        ``"model": "local"`` — works without any client-side configuration.
+        """
         model_id = request_model or path_model or self._default_model
         if not model_id:
             raise HTTPException(status_code=400, detail="No model provided.")
+        # Resolve well-known aliases (e.g. "local" sent by Niblit's local_brain)
+        if model_id.lower() in _LOCAL_MODEL_ALIASES:
+            if not self._default_model:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Model alias '{model_id}' received but no default model is "
+                        "configured. Set DEFAULT_MODEL_ID and GGUF_MODELS_JSON."
+                    ),
+                )
+            return self._default_model
         if model_id not in self._model_map:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
         return model_id
@@ -119,8 +151,28 @@ class ModelManager:
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
-    temperature: float = 0.2
-    max_tokens: int = 256
+    temperature: float = _DEFAULT_TEMPERATURE
+    max_tokens: int = _DEFAULT_MAX_TOKENS
+    # Accepted for llama-server API compatibility; passed through to the engine.
+    stop: list[str] | None = None
+    # Tool schemas (Niblit generate_with_tools); accepted and ignored if not supported.
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | None = None
+
+
+class CompletionRequest(BaseModel):
+    """Legacy llama-server /completion endpoint schema.
+
+    Niblit's ``QwenLocalBrain._generate_http_legacy()`` falls back to this
+    endpoint when ``POST /v1/chat/completions`` returns HTTP 404.  The
+    request body uses ``prompt`` (plain string) and ``n_predict`` (max tokens).
+    """
+
+    prompt: str
+    n_predict: int = _DEFAULT_MAX_TOKENS
+    temperature: float = _DEFAULT_TEMPERATURE
+    stop: list[str] | None = None
+    model: str | None = None
 
 
 class InferenceRequest(BaseModel):
@@ -169,8 +221,25 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     app.state.model_manager = model_manager or ModelManager(models, default_model)
 
     @app.get("/healthz")
+    @app.get("/health")
     def health() -> dict[str, str]:
+        """Health check — responds to both /health (llama-server probe) and /healthz."""
         return {"status": "ok"}
+
+    @app.get("/props")
+    def props() -> dict[str, Any]:
+        """Legacy llama-server /props probe endpoint.
+
+        Niblit's ``_check_server_url`` probes /props as a last resort when
+        /health and /v1/models are unavailable.  Returns a minimal JSON object
+        so the probe succeeds.
+        """
+        manager: ModelManager = app.state.model_manager
+        info = manager.get_default_model_info()
+        return {
+            "model_path": info["model_path"],
+            "total_slots": 1,
+        }
 
     @app.get("/v1/models")
     @app.get("/models")
@@ -202,6 +271,27 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     def chat_completions(payload: ChatCompletionRequest, path_model: str | None = None) -> dict[str, Any]:
         return handle_chat(payload, path_model)
 
+    @app.post("/completion")
+    def legacy_completion(payload: CompletionRequest) -> dict[str, Any]:
+        """Legacy llama-server ``POST /completion`` endpoint.
+
+        Niblit's ``QwenLocalBrain._generate_http_legacy()`` falls back here
+        when the /v1/chat/completions endpoint returned HTTP 404.  The prompt
+        is wrapped into a single-user chat message and forwarded to the model.
+        The response uses the ``{"content": "..."}`` shape that llama-server
+        returns.
+        """
+        manager: ModelManager = app.state.model_manager
+        model_id = manager.resolve_model_id(payload.model, None)
+        messages: list[dict[str, str]] = [{"role": "user", "content": payload.prompt}]
+        result = manager.chat(
+            model_id=model_id,
+            messages=messages,
+            temperature=payload.temperature,
+            max_tokens=payload.n_predict,
+        )
+        return {"content": result.text}
+
     @app.post("/models/{path_model}")
     def inference_api(path_model: str, payload: InferenceRequest) -> dict[str, Any]:
         manager: ModelManager = app.state.model_manager
@@ -213,8 +303,8 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         else:
             raise HTTPException(status_code=400, detail="Provide either inputs or messages")
 
-        temperature = float(payload.parameters.get("temperature", 0.2))
-        max_tokens = int(payload.parameters.get("max_new_tokens", 256))
+        temperature = float(payload.parameters.get("temperature", _DEFAULT_TEMPERATURE))
+        max_tokens = int(payload.parameters.get("max_new_tokens", _DEFAULT_MAX_TOKENS))
         result = manager.chat(
             model_id=model_id,
             messages=messages,
@@ -241,6 +331,11 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             methods=["POST"],
         )
         app.add_api_route(
+            f"/{prefix}/completion",
+            legacy_completion,
+            methods=["POST"],
+        )
+        app.add_api_route(
             f"/{prefix}/models/{{path_model}}",
             inference_api,
             methods=["POST"],
@@ -248,6 +343,11 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         app.add_api_route(
             f"/{prefix}/v1/models",
             list_models,
+            methods=["GET"],
+        )
+        app.add_api_route(
+            f"/{prefix}/health",
+            health,
             methods=["GET"],
         )
 
