@@ -48,8 +48,24 @@ class GGUFEngine:
             max_tokens=max_tokens,
             stream=False,
         )
-        choice = response["choices"][0]
-        text = choice["message"]["content"]
+        choices = response.get("choices")
+        if not isinstance(choices, list):
+            raise RuntimeError(
+                "Model returned unexpected response format: choices must be a list "
+                f"(got {type(choices).__name__})."
+            )
+        if not choices:
+            raise RuntimeError(
+                "Model returned unexpected response format: choices must not be empty "
+                f"(response keys: {sorted(response.keys())})."
+            )
+        choice = choices[0]
+        message = choice.get("message") if isinstance(choice, dict) else None
+        text = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(text, str):
+            raise RuntimeError(
+                "Model returned unexpected response format: message.content must be a string."
+            )
         usage = response.get("usage")
         return ModelEngineResult(
             text=text,
@@ -75,6 +91,7 @@ class ModelManager:
         return {"id": model_id, "object": "model"}
 
     def resolve_model_id(self, request_model: str | None, path_model: str | None) -> str:
+        """Resolve model precedence as request model > path model > default model."""
         model_id = request_model or path_model or self._default_model
         if not model_id:
             raise HTTPException(status_code=400, detail="No model provided.")
@@ -91,9 +108,12 @@ class ModelManager:
                 n_ctx=self._n_ctx,
                 n_threads=self._n_threads,
             )
-        return self._engines[model_id].chat(
-            messages=messages, temperature=temperature, max_tokens=max_tokens
-        )
+        try:
+            return self._engines[model_id].chat(
+                messages=messages, temperature=temperature, max_tokens=max_tokens
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 class ChatCompletionRequest(BaseModel):
@@ -203,8 +223,9 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         )
         return {"generated_text": result.text, "model": model_id}
 
+    # Strip spaces and slashes so values like " hf ", "/local/" remain valid.
     compat_prefixes = [
-        p.strip().strip("/")
+        p.strip(" /")
         for p in os.getenv("COMPAT_PREFIXES", "hf,local,kimi,claude").split(",")
         if p.strip()
     ]
