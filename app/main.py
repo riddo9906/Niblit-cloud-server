@@ -1,12 +1,16 @@
 import json
+import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 # Niblit's QwenLocalBrain._generate_http() always sends "model": "local" in
 # every request so the cloud server can act as a drop-in llama-server
@@ -40,6 +44,7 @@ class ModelEngineResult:
 
 class GGUFEngine:
     def __init__(self, model_path: str, n_ctx: int, n_threads: int):
+        logger.info("Loading model from %s (n_ctx=%d, n_threads=%d)", model_path, n_ctx, n_threads)
         try:
             from llama_cpp import Llama
         except ImportError as exc:
@@ -47,6 +52,7 @@ class GGUFEngine:
                 "llama-cpp-python is required to run GGUF inference."
             ) from exc
         self._llm = Llama(model_path=model_path, n_ctx=n_ctx, n_threads=n_threads)
+        logger.info("Model loaded successfully from %s", model_path)
 
     def chat(
         self, messages: list[dict[str, str]], temperature: float, max_tokens: int
@@ -90,6 +96,13 @@ class ModelManager:
         self._engines: dict[str, GGUFEngine] = {}
         self._n_ctx = int(os.getenv("N_CTX", "4096"))
         self._n_threads = int(os.getenv("N_THREADS", "4"))
+        logger.info(
+            "ModelManager initialized: models=%s default=%s n_ctx=%d n_threads=%d",
+            list(model_map.keys()),
+            self._default_model,
+            self._n_ctx,
+            self._n_threads,
+        )
 
     def get_default_model_info(self) -> dict[str, str]:
         """Return {model_id, model_path} for the default model (empty strings if none)."""
@@ -140,12 +153,26 @@ class ModelManager:
                 n_ctx=self._n_ctx,
                 n_threads=self._n_threads,
             )
+        logger.debug(
+            "chat request: model=%s messages=%d temperature=%s max_tokens=%d",
+            model_id,
+            len(messages),
+            temperature,
+            max_tokens,
+        )
         try:
-            return self._engines[model_id].chat(
+            result = self._engines[model_id].chat(
                 messages=messages, temperature=temperature, max_tokens=max_tokens
             )
         except RuntimeError as exc:
+            logger.error("Inference error for model %s: %s", model_id, exc)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        logger.debug(
+            "chat response: model=%s finish_reason=%s",
+            model_id,
+            result.finish_reason,
+        )
+        return result
 
 
 class ChatCompletionRequest(BaseModel):
@@ -215,10 +242,37 @@ def _build_chat_response(model_id: str, result: ModelEngineResult) -> dict[str, 
 
 
 def create_app(model_manager: ModelManager | None = None) -> FastAPI:
-    app = FastAPI(title="Niblit Cloud GGUF Server", version="0.1.0")
     models = _load_models_from_env()
     default_model = os.getenv("DEFAULT_MODEL_ID")
-    app.state.model_manager = model_manager or ModelManager(models, default_model)
+    _manager = model_manager or ModelManager(models, default_model)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        info = _manager.get_default_model_info()
+        logger.info(
+            "Niblit Cloud GGUF Server starting — models=%s default=%s",
+            list(models.keys()),
+            info["model_id"] or "(none)",
+        )
+        yield
+        logger.info("Niblit Cloud GGUF Server shutdown complete.")
+
+    app = FastAPI(title="Niblit Cloud GGUF Server", version="0.1.0", lifespan=lifespan)
+    app.state.model_manager = _manager
+
+    @app.middleware("http")
+    async def log_requests(request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "%s %s -> %d (%.1f ms)",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+        )
+        return response
 
     @app.get("/healthz")
     @app.get("/health")
