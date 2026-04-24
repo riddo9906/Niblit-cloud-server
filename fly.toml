@@ -1,0 +1,63 @@
+# fly.toml app configuration file for niblit-cloud-server
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+# Deploy with: fly deploy
+#
+# Required secrets (set via `fly secrets set`):
+#   GGUF_MODELS_JSON  — JSON object mapping model-id to GGUF file path on the volume,
+#                       e.g. '{"qwen2.5-0.5b":"/data/qwen2.5-0.5b-instruct-q4_k_m.gguf"}'
+#
+# The Niblit app connects to this server via:
+#   NIBLIT_CLOUD_SERVER_URL=https://niblit-cloud-server.fly.dev
+#   NIBLIT_GGUF_BACKEND=http
+#   NIBLIT_LLAMA_SERVER_URL=https://niblit-cloud-server.fly.dev
+
+app = 'niblit-cloud-server'
+primary_region = 'iad'
+kill_signal = 'SIGTERM'
+kill_timeout = '1m0s'
+swap_size_mb = 512
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[deploy]
+  strategy = 'rolling'
+
+[env]
+  APP_ENV = 'production'
+  COMPAT_PREFIXES = 'hf,local,kimi,claude'
+  DEFAULT_MODEL_ID = 'qwen2.5-0.5b'
+  N_CTX = '4096'
+  N_THREADS = '4'
+  PORT = '8000'
+
+[[mounts]]
+  source = 'niblit_cloud_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+  [http_service.concurrency]
+    type = 'requests'
+    hard_limit = 50
+    soft_limit = 25
+
+  [[http_service.checks]]
+    interval = '15s'
+    timeout = '10s'
+    grace_period = '20s'
+    method = 'GET'
+    path = '/health'
+    protocol = 'http'
+
+[[vm]]
+  size = 'shared-cpu-2x'
+  memory = '2048mb'
