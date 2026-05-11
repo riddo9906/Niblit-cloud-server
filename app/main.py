@@ -7,10 +7,21 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+# ── Cognitive runtime modules (best-effort imports) ───────────────────────────
+# All new modules degrade gracefully if disabled or unavailable.
+
+def _try_import(module_path: str) -> Any:
+    """Best-effort import of a cloud runtime module."""
+    try:
+        import importlib
+        return importlib.import_module(module_path)
+    except Exception:
+        return None
 
 # Niblit's QwenLocalBrain._generate_http() always sends "model": "local" in
 # every request so the cloud server can act as a drop-in llama-server
@@ -185,6 +196,23 @@ class ChatCompletionRequest(BaseModel):
     # Tool schemas (Niblit generate_with_tools); accepted and ignored if not supported.
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | None = None
+    # ── Cognitive envelope fields (Phase Ω.7) — all optional ──────────────────
+    # Plain OpenAI/HF requests that omit these fields remain fully compatible.
+    intent: str | None = None
+    execution_mode: str | None = None
+    coherence_score: float | None = None
+    constitutional_priority: str | None = None
+    attention_budget: float | None = None
+    resource_mode: str | None = None
+    epoch_tag: str | None = None
+    forecast_context: dict[str, Any] | None = None
+    governance_context: dict[str, Any] | None = None
+    tool_context: dict[str, Any] | None = None
+    reflection_context: dict[str, Any] | None = None
+    identity_context: dict[str, Any] | None = None
+    governance: dict[str, Any] | None = None
+    temporal: dict[str, Any] | None = None
+    runtime: dict[str, Any] | None = None
 
 
 class CompletionRequest(BaseModel):
@@ -246,22 +274,48 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     default_model = os.getenv("DEFAULT_MODEL_ID")
     _manager = model_manager or ModelManager(models, default_model)
 
+    # ── Boot cognitive runtime subsystems ─────────────────────────────────────
+    _event_bus_mod   = _try_import("app.event_bus")
+    _envelope_mod    = _try_import("app.cognitive_envelope")
+    _governance_mod  = _try_import("app.cloud_governance")
+    _temporal_mod    = _try_import("app.temporal_sync")
+    _reflection_mod  = _try_import("app.reflection_engine")
+    _orchestrator_mod = _try_import("app.model_orchestrator")
+    _attention_mod   = _try_import("app.attention_allocator")
+    _trading_mod     = _try_import("app.trading_runtime_bridge")
+    _identity_mod    = _try_import("app.node_identity")
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         info = _manager.get_default_model_info()
         logger.info(
-            "Niblit Cloud GGUF Server starting — models=%s default=%s",
+            "Niblit Cognitive Cloud Runtime starting — models=%s default=%s",
             list(models.keys()),
             info["model_id"] or "(none)",
         )
+        # Seed orchestrator with known model IDs
+        if _orchestrator_mod:
+            _orchestrator_mod.get_model_orchestrator(model_ids=list(models.keys()))
+        # Initialize node identity
+        if _identity_mod:
+            _identity_mod.get_node_identity()
         yield
-        logger.info("Niblit Cloud GGUF Server shutdown complete.")
+        logger.info("Niblit Cognitive Cloud Runtime shutdown complete.")
 
-    app = FastAPI(title="Niblit Cloud GGUF Server", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(
+        title="Niblit Cognitive Cloud Runtime",
+        version="0.7.0",
+        description=(
+            "Distributed cognitive execution + cognition + orchestration node. "
+            "Backward compatible with HuggingFace-style APIs, llama.cpp, and "
+            "QwenLocalBrain. Phase Ω.7."
+        ),
+        lifespan=lifespan,
+    )
     app.state.model_manager = _manager
 
     @app.middleware("http")
-    async def log_requests(request, call_next):
+    async def log_requests(request: Request, call_next):
         start = time.perf_counter()
         response = await call_next(request)
         duration_ms = (time.perf_counter() - start) * 1000
@@ -272,7 +326,15 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             response.status_code,
             duration_ms,
         )
+        # Increment node identity request counter
+        if _identity_mod:
+            try:
+                _identity_mod.get_node_identity().increment_request()
+            except Exception:
+                pass
         return response
+
+    # ── Existing health/probe endpoints (unchanged) ───────────────────────────
 
     @app.get("/healthz")
     @app.get("/health")
@@ -282,12 +344,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/props")
     def props() -> dict[str, Any]:
-        """Legacy llama-server /props probe endpoint.
-
-        Niblit's ``_check_server_url`` probes /props as a last resort when
-        /health and /v1/models are unavailable.  Returns a minimal JSON object
-        so the probe succeeds.
-        """
+        """Legacy llama-server /props probe endpoint."""
         manager: ModelManager = app.state.model_manager
         info = manager.get_default_model_info()
         return {
@@ -307,17 +364,184 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         manager: ModelManager = app.state.model_manager
         return manager.get_model(model_id)
 
+    # ── Internal helper: extract envelope from request ────────────────────────
+
+    def _extract_envelope(payload: ChatCompletionRequest) -> dict[str, Any]:
+        """Build a cognitive envelope dict from the request payload fields."""
+        if _envelope_mod is None:
+            return {}
+        raw: dict[str, Any] = {}
+        if payload.intent is not None:
+            raw["intent"] = payload.intent
+        if payload.execution_mode is not None:
+            raw["execution_mode"] = payload.execution_mode
+        if payload.coherence_score is not None:
+            raw["coherence_score"] = payload.coherence_score
+        if payload.constitutional_priority is not None:
+            raw["constitutional_priority"] = payload.constitutional_priority
+        if payload.attention_budget is not None:
+            raw["attention_budget"] = payload.attention_budget
+        if payload.resource_mode is not None:
+            raw["resource_mode"] = payload.resource_mode
+        if payload.epoch_tag is not None:
+            raw["epoch_tag"] = payload.epoch_tag
+        if payload.forecast_context is not None:
+            raw["forecast_context"] = payload.forecast_context
+        if payload.governance_context is not None:
+            raw["governance_context"] = payload.governance_context
+        if payload.governance is not None:
+            raw["governance"] = payload.governance
+        if payload.temporal is not None:
+            raw["temporal"] = payload.temporal
+        if payload.runtime is not None:
+            raw["runtime"] = payload.runtime
+        if payload.tool_context is not None:
+            raw["tool_context"] = payload.tool_context
+        if payload.reflection_context is not None:
+            raw["reflection_context"] = payload.reflection_context
+        if payload.identity_context is not None:
+            raw["identity_context"] = payload.identity_context
+        return _envelope_mod.normalize_envelope(raw)
+
+    # ── Core chat handler (shared by all chat endpoints) ─────────────────────
+
     def handle_chat(payload: ChatCompletionRequest, path_model: str | None = None) -> dict[str, Any]:
+        start_ms = time.perf_counter() * 1000
+        request_id = uuid.uuid4().hex
+
         manager: ModelManager = app.state.model_manager
-        model_id = manager.resolve_model_id(payload.model, path_model)
+
+        # ── Build cognitive envelope ───────────────────────────────────────────
+        envelope = _extract_envelope(payload)
+
+        # ── Attention allocation ───────────────────────────────────────────────
+        allocation = None
+        if _attention_mod:
+            try:
+                allocation = _attention_mod.get_attention_allocator().score_request(
+                    request_id, envelope=envelope
+                )
+                if not allocation.granted:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "error": "attention_overload",
+                            "message": "Runtime is overloaded. Request denied by attention allocator.",
+                            "rationale": allocation.to_dict(),
+                        },
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+
+        # ── Governance validation ──────────────────────────────────────────────
+        governance_vetoed = False
+        if _governance_mod:
+            try:
+                verdict = _governance_mod.get_cloud_governance().validate(
+                    action="chat_inference",
+                    envelope=envelope,
+                    messages=payload.messages,
+                    max_tokens=payload.max_tokens,
+                )
+                if not verdict.allowed:
+                    governance_vetoed = True
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "error": "governance_violation",
+                            "message": verdict.reason,
+                            "violated": verdict.violated,
+                            "rationale": verdict.rationale,
+                        },
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+
+        # ── Temporal sync ──────────────────────────────────────────────────────
+        if _temporal_mod:
+            try:
+                _temporal_mod.get_temporal_sync().record_request(
+                    coherence=float(envelope.get("coherence_score", 1.0)),
+                    epoch_tag=str(envelope.get("epoch_tag", "")),
+                )
+            except Exception:
+                pass
+
+        # ── Model orchestration ────────────────────────────────────────────────
+        available_models = list(manager._model_map.keys())
+        request_model_id = manager.resolve_model_id(payload.model, path_model)
+
+        if _orchestrator_mod and len(available_models) > 1:
+            try:
+                decision = _orchestrator_mod.get_model_orchestrator().route(
+                    available_models=available_models,
+                    default_model=request_model_id,
+                    envelope=envelope,
+                )
+                # Only use orchestrated model if it matches one we can resolve
+                if decision.model_id in available_models:
+                    request_model_id = decision.model_id
+            except Exception:
+                pass
+
         messages = _normalize_messages(payload.messages)
         result = manager.chat(
-            model_id=model_id,
+            model_id=request_model_id,
             messages=messages,
             temperature=payload.temperature,
             max_tokens=payload.max_tokens,
         )
-        return _build_chat_response(model_id, result)
+
+        end_ms = time.perf_counter() * 1000
+        latency_ms = end_ms - start_ms
+        token_count = (result.usage or {}).get("completion_tokens", 0)
+
+        # ── Record outcome in subsystems ───────────────────────────────────────
+        if _orchestrator_mod:
+            try:
+                _orchestrator_mod.get_model_orchestrator().record_outcome(
+                    request_model_id, success=True, latency_ms=latency_ms, quality=0.8
+                )
+            except Exception:
+                pass
+
+        if _reflection_mod:
+            try:
+                quality = min(1.0, max(0.0, 1.0 - latency_ms / 10_000))
+                _reflection_mod.get_reflection_engine().record_turn(
+                    quality=quality,
+                    latency_ms=latency_ms,
+                    coherence=float(envelope.get("coherence_score", 1.0)),
+                    model_id=request_model_id,
+                    intent=str(envelope.get("intent", "conversational")),
+                    governance_vetoed=governance_vetoed,
+                    token_count=token_count,
+                )
+            except Exception:
+                pass
+
+        if _attention_mod and allocation:
+            try:
+                _attention_mod.get_attention_allocator().release(request_id)
+            except Exception:
+                pass
+
+        response = _build_chat_response(request_model_id, result)
+
+        # Attach cognitive metadata if envelope was supplied
+        if envelope.get("intent"):
+            response["cognitive"] = {
+                "request_id": request_id,
+                "intent": envelope.get("intent"),
+                "governance_mode": (envelope.get("governance") or {}).get("governance_mode", "normal"),
+                "latency_ms": round(latency_ms, 1),
+            }
+
+        return response
 
     @app.post("/v1/chat/completions")
     @app.post("/chat/completions")
@@ -327,14 +551,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.post("/completion")
     def legacy_completion(payload: CompletionRequest) -> dict[str, Any]:
-        """Legacy llama-server ``POST /completion`` endpoint.
-
-        Niblit's ``QwenLocalBrain._generate_http_legacy()`` falls back here
-        when the /v1/chat/completions endpoint returned HTTP 404.  The prompt
-        is wrapped into a single-user chat message and forwarded to the model.
-        The response uses the ``{"content": "..."}`` shape that llama-server
-        returns.
-        """
+        """Legacy llama-server ``POST /completion`` endpoint."""
         manager: ModelManager = app.state.model_manager
         model_id = manager.resolve_model_id(payload.model, None)
         messages: list[dict[str, str]] = [{"role": "user", "content": payload.prompt}]
@@ -367,7 +584,209 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         )
         return {"generated_text": result.text, "model": model_id}
 
-    # Strip spaces and slashes so values like " hf ", "/local/" remain valid.
+    # ── Cognitive chat endpoint (enriched response) ───────────────────────────
+
+    @app.post("/v1/cognitive/chat")
+    def cognitive_chat(payload: ChatCompletionRequest) -> dict[str, Any]:
+        """Cognitive chat endpoint — same as /v1/chat/completions with richer metadata."""
+        return handle_chat(payload)
+
+    # ── Runtime status endpoints ───────────────────────────────────────────────
+
+    @app.get("/v1/runtime/status")
+    def runtime_status() -> dict[str, Any]:
+        """Full runtime status snapshot."""
+        manager: ModelManager = app.state.model_manager
+        status: dict[str, Any] = {
+            "runtime": "niblit_cognitive_cloud_runtime",
+            "version": "0.7.0",
+            "phase": "omega.7",
+            "models": manager.list_models(),
+            "default_model": manager.get_default_model_info(),
+        }
+        if _identity_mod:
+            try:
+                status["node"] = _identity_mod.get_node_identity().snapshot().to_dict()
+            except Exception:
+                pass
+        if _temporal_mod:
+            try:
+                status["temporal"] = _temporal_mod.get_temporal_sync().status()
+            except Exception:
+                pass
+        if _attention_mod:
+            try:
+                status["attention"] = _attention_mod.get_attention_allocator().status()
+            except Exception:
+                pass
+        return status
+
+    @app.get("/v1/runtime/coherence")
+    def runtime_coherence() -> dict[str, Any]:
+        """Temporal coherence and epoch sync status."""
+        result: dict[str, Any] = {}
+        if _temporal_mod:
+            try:
+                result = _temporal_mod.get_temporal_sync().status()
+            except Exception:
+                result = {"error": "temporal_sync_unavailable"}
+        return result
+
+    @app.get("/v1/runtime/governance")
+    def runtime_governance() -> dict[str, Any]:
+        """Constitutional governance statistics."""
+        result: dict[str, Any] = {}
+        if _governance_mod:
+            try:
+                result = _governance_mod.get_cloud_governance().status()
+            except Exception:
+                result = {"error": "governance_unavailable"}
+        return result
+
+    @app.get("/v1/runtime/attention")
+    def runtime_attention() -> dict[str, Any]:
+        """Attention economy metrics."""
+        result: dict[str, Any] = {}
+        if _attention_mod:
+            try:
+                result = _attention_mod.get_attention_allocator().status()
+            except Exception:
+                result = {"error": "attention_allocator_unavailable"}
+        return result
+
+    @app.get("/v1/runtime/models")
+    def runtime_models() -> dict[str, Any]:
+        """Model orchestration health and routing statistics."""
+        manager: ModelManager = app.state.model_manager
+        result: dict[str, Any] = {
+            "registered_models": manager.list_models(),
+        }
+        if _orchestrator_mod:
+            try:
+                result["orchestrator"] = _orchestrator_mod.get_model_orchestrator().status()
+            except Exception:
+                result["orchestrator_error"] = "unavailable"
+        return result
+
+    @app.get("/v1/runtime/reflection")
+    def runtime_reflection() -> dict[str, Any]:
+        """Reflection engine telemetry."""
+        result: dict[str, Any] = {}
+        if _reflection_mod:
+            try:
+                re = _reflection_mod.get_reflection_engine()
+                status = re.status()
+                snap = re.last_snapshot()
+                result = {**status, "last_snapshot": snap.to_dict() if snap else None}
+            except Exception:
+                result = {"error": "reflection_unavailable"}
+        return result
+
+    @app.get("/v1/runtime/trading")
+    def runtime_trading() -> dict[str, Any]:
+        """Trading cognition bridge status and market state."""
+        result: dict[str, Any] = {}
+        if _trading_mod:
+            try:
+                bridge = _trading_mod.get_trading_bridge()
+                bridge.refresh()
+                result = bridge.status()
+            except Exception:
+                result = {"error": "trading_bridge_unavailable"}
+        return result
+
+    @app.get("/v1/runtime/epoch")
+    def runtime_epoch() -> dict[str, Any]:
+        """Current epoch and temporal ordering state."""
+        if _temporal_mod:
+            try:
+                ts = _temporal_mod.get_temporal_sync()
+                return {
+                    "epoch_id": ts.current_epoch(),
+                    "coherence": round(ts.coherence(), 4),
+                    "status": ts.status(),
+                }
+            except Exception:
+                pass
+        return {"epoch_id": int(time.time()), "coherence": 1.0}
+
+    # ── Metrics endpoints ──────────────────────────────────────────────────────
+
+    @app.get("/metrics/cognitive")
+    def metrics_cognitive() -> dict[str, Any]:
+        """Cognitive telemetry metrics."""
+        result: dict[str, Any] = {}
+        if _reflection_mod:
+            try:
+                result = _reflection_mod.get_reflection_engine().status()
+            except Exception:
+                pass
+        return result
+
+    @app.get("/metrics/coherence")
+    def metrics_coherence() -> dict[str, Any]:
+        """Coherence metrics."""
+        if _temporal_mod:
+            try:
+                return _temporal_mod.get_temporal_sync().status()
+            except Exception:
+                pass
+        return {}
+
+    @app.get("/metrics/governance")
+    def metrics_governance() -> dict[str, Any]:
+        """Governance metrics."""
+        if _governance_mod:
+            try:
+                return _governance_mod.get_cloud_governance().status()
+            except Exception:
+                pass
+        return {}
+
+    @app.get("/metrics/models")
+    def metrics_models() -> dict[str, Any]:
+        """Model routing and health metrics."""
+        if _orchestrator_mod:
+            try:
+                return _orchestrator_mod.get_model_orchestrator().status()
+            except Exception:
+                pass
+        return {}
+
+    # ── Cluster / swarm readiness endpoints ───────────────────────────────────
+
+    @app.get("/cluster/status")
+    def cluster_status() -> dict[str, Any]:
+        """Cluster status (single-node; federation not yet implemented)."""
+        if _identity_mod:
+            try:
+                return _identity_mod.get_node_identity().cluster_status()
+            except Exception:
+                pass
+        return {"status": "single_node", "federation_ready": False}
+
+    @app.get("/cluster/identity")
+    def cluster_identity() -> dict[str, Any]:
+        """Node identity and fingerprint."""
+        if _identity_mod:
+            try:
+                return _identity_mod.get_node_identity().snapshot().to_dict()
+            except Exception:
+                pass
+        return {}
+
+    @app.get("/cluster/capabilities")
+    def cluster_capabilities() -> dict[str, Any]:
+        """Advertised node capabilities."""
+        if _identity_mod:
+            try:
+                return _identity_mod.get_node_identity().snapshot().capabilities.to_dict()
+            except Exception:
+                pass
+        return {}
+
+    # ── Compatibility prefix routes (unchanged) ────────────────────────────────
+
     compat_prefixes = [
         p.strip(" /")
         for p in os.getenv("COMPAT_PREFIXES", "hf,local,kimi,claude").split(",")
