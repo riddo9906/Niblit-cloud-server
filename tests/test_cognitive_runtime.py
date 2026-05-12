@@ -584,7 +584,36 @@ class TestNodeIdentity:
         caps = identity.snapshot().capabilities.to_dict()
         assert caps["supports_gguf"]
         assert caps["supports_cognitive_envelope"]
+        assert caps["supports_federation_stub"] is True
         assert caps["swarm_ready"] is False  # not yet implemented
+
+
+# ── federation stubs ───────────────────────────────────────────────────────────
+
+
+class TestFederationStubs:
+    def test_federation_status_defaults_to_standalone(self):
+        from app.federation import get_federation_manager
+
+        status = get_federation_manager().status()
+        assert status["status"] == "standalone"
+        assert "registration_count" in status
+
+    def test_register_peer_is_stubbed_and_recorded(self):
+        from app.federation import NodeRegistration, get_federation_manager
+
+        fm = get_federation_manager()
+        out = fm.register_peer(
+            NodeRegistration(
+                node_id="peer-a",
+                region="test",
+                role="inference",
+                base_url="http://peer-a:8000",
+            )
+        )
+        assert out["accepted"] is True
+        peers = fm.list_peers()
+        assert any(p["node_id"] == "peer-a" for p in peers)
 
 
 # ── New API endpoints ─────────────────────────────────────────────────────────
@@ -617,6 +646,20 @@ class TestCognitiveAPIEndpoints:
         client, _ = make_client()
         response = client.get("/v1/runtime/coherence")
         assert response.status_code == 200
+
+    def test_runtime_mode_endpoint(self):
+        client, _ = make_client()
+        response = client.get("/v1/runtime/mode")
+        assert response.status_code == 200
+        data = response.json()
+        assert "mode" in data
+
+    def test_runtime_node_endpoint(self):
+        client, _ = make_client()
+        response = client.get("/v1/runtime/node")
+        assert response.status_code == 200
+        data = response.json()
+        assert "node_id" in data
 
     def test_runtime_governance_endpoint(self):
         client, _ = make_client()
@@ -692,6 +735,41 @@ class TestCognitiveAPIEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert "supports_gguf" in data
+
+    def test_runtime_diagnostics_endpoint(self):
+        client, _ = make_client()
+        response = client.get("/v1/runtime/diagnostics")
+        assert response.status_code == 200
+        data = response.json()
+        assert "runtime_health" in data
+        assert "attention_pressure" in data
+        assert "governance_violations" in data
+        assert "coherence_drift" in data
+
+    def test_federation_status_endpoint(self):
+        client, _ = make_client()
+        response = client.get("/federation/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert "status" in data
+
+    def test_federation_register_and_peers_endpoints(self):
+        client, _ = make_client()
+        reg = client.post(
+            "/federation/register",
+            json={
+                "node_id": "peer-test",
+                "region": "local",
+                "role": "inference",
+                "base_url": "http://peer-test:8000",
+                "capabilities": {"supports_gguf": True},
+            },
+        )
+        assert reg.status_code == 200
+        assert reg.json()["accepted"] is True
+        peers = client.get("/federation/peers")
+        assert peers.status_code == 200
+        assert "peers" in peers.json()
 
     def test_cognitive_envelope_fields_in_chat_request(self):
         """Chat request with full cognitive envelope should still return valid response."""

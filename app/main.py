@@ -284,6 +284,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     _attention_mod   = _try_import("app.attention_allocator")
     _trading_mod     = _try_import("app.trading_runtime_bridge")
     _identity_mod    = _try_import("app.node_identity")
+    _federation_mod  = _try_import("app.federation")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -299,6 +300,8 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         # Initialize node identity
         if _identity_mod:
             _identity_mod.get_node_identity()
+        if _federation_mod:
+            _federation_mod.get_federation_manager()
         yield
         logger.info("Niblit Cognitive Cloud Runtime shutdown complete.")
 
@@ -710,6 +713,144 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 pass
         return {"epoch_id": int(time.time()), "coherence": 1.0}
 
+    @app.get("/v1/runtime/mode")
+    def runtime_mode() -> dict[str, Any]:
+        """Current runtime/governance mode and adaptation posture."""
+        mode = "normal"
+        strict = None
+        if _governance_mod:
+            try:
+                g = _governance_mod.get_cloud_governance().status()
+                strict = g.get("strict_mode")
+                if g.get("block_rate", 0.0) > 0.2:
+                    mode = "cautious"
+            except Exception:
+                pass
+        if _attention_mod:
+            try:
+                if _attention_mod.get_attention_allocator().status().get("overload"):
+                    mode = "survival"
+            except Exception:
+                pass
+        return {
+            "mode": mode,
+            "strict_governance": strict,
+            "phase": "omega.7",
+            "resource_adaptation": "attention_economy",
+        }
+
+    @app.get("/v1/runtime/node")
+    def runtime_node() -> dict[str, Any]:
+        """Node identity + cluster/federation posture."""
+        node: dict[str, Any] = {}
+        if _identity_mod:
+            try:
+                node = _identity_mod.get_node_identity().snapshot().to_dict()
+            except Exception:
+                node = {}
+        if _federation_mod:
+            try:
+                node["federation"] = _federation_mod.get_federation_manager().status()
+            except Exception:
+                pass
+        return node
+
+    @app.get("/v1/runtime/diagnostics")
+    def runtime_diagnostics() -> dict[str, Any]:
+        """Operational diagnostics for governance-aware runtime operations."""
+        diagnostics: dict[str, Any] = {
+            "runtime_health": 1.0,
+            "inference_pressure": {},
+            "attention_pressure": {},
+            "model_latency_ema": {},
+            "governance_violations": {},
+            "thermal_resource_state": {
+                "cpu_load": None,
+                "memory_pressure": None,
+                "resource_mode": "balanced",
+                "note": "Host thermal metrics are not available in-process.",
+            },
+            "reflection_statistics": {},
+            "coherence_drift": {},
+            "federation": {"status": "standalone"},
+        }
+
+        try:
+            diagnostics["runtime_health"] = 1.0 if health().get("status") == "ok" else 0.0
+        except Exception:
+            diagnostics["runtime_health"] = 0.0
+
+        if _attention_mod:
+            try:
+                a = _attention_mod.get_attention_allocator().status()
+                diagnostics["attention_pressure"] = a
+                diagnostics["inference_pressure"] = {
+                    "active_requests": a.get("active_requests", 0),
+                    "max_queue": a.get("max_queue", 0),
+                    "pressure_ema": a.get("attention_pressure", 0.0),
+                    "overload": a.get("overload", False),
+                }
+                if a.get("overload"):
+                    diagnostics["thermal_resource_state"]["resource_mode"] = "minimal"
+            except Exception:
+                pass
+
+        if _orchestrator_mod:
+            try:
+                ms = _orchestrator_mod.get_model_orchestrator().status()
+                diagnostics["model_latency_ema"] = {
+                    mid: h.get("latency_ema_ms")
+                    for mid, h in (ms.get("model_health") or {}).items()
+                }
+            except Exception:
+                pass
+
+        if _governance_mod:
+            try:
+                gs = _governance_mod.get_cloud_governance().status()
+                diagnostics["governance_violations"] = gs.get("violation_counts", {})
+                diagnostics["governance"] = {
+                    "strict_mode": gs.get("strict_mode"),
+                    "validation_count": gs.get("validation_count"),
+                    "block_count": gs.get("block_count"),
+                    "block_rate": gs.get("block_rate"),
+                }
+            except Exception:
+                pass
+
+        if _reflection_mod:
+            try:
+                rs = _reflection_mod.get_reflection_engine().status()
+                diagnostics["reflection_statistics"] = {
+                    "turn_count": rs.get("turn_count"),
+                    "reflect_count": rs.get("reflect_count"),
+                    "quality_ema": rs.get("quality_ema"),
+                    "latency_ema_ms": rs.get("latency_ema_ms"),
+                    "veto_rate": rs.get("veto_rate"),
+                }
+            except Exception:
+                pass
+
+        if _temporal_mod:
+            try:
+                ts = _temporal_mod.get_temporal_sync().status()
+                diagnostics["coherence_drift"] = {
+                    "coherence_ema": ts.get("coherence_ema"),
+                    "coherence_lag": ts.get("coherence_lag"),
+                    "sync_status": ts.get("sync_status"),
+                    "epoch_id": ts.get("epoch_id"),
+                }
+            except Exception:
+                pass
+
+        if _federation_mod:
+            try:
+                diagnostics["federation"] = _federation_mod.get_federation_manager().status()
+            except Exception:
+                pass
+
+        return diagnostics
+
     # ── Metrics endpoints ──────────────────────────────────────────────────────
 
     @app.get("/metrics/cognitive")
@@ -758,12 +899,21 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     @app.get("/cluster/status")
     def cluster_status() -> dict[str, Any]:
         """Cluster status (single-node; federation not yet implemented)."""
+        fed_status: dict[str, Any] = {}
+        if _federation_mod:
+            try:
+                fed_status = _federation_mod.get_federation_manager().status()
+            except Exception:
+                fed_status = {}
         if _identity_mod:
             try:
-                return _identity_mod.get_node_identity().cluster_status()
+                result = _identity_mod.get_node_identity().cluster_status()
+                if fed_status:
+                    result["federation"] = fed_status
+                return result
             except Exception:
                 pass
-        return {"status": "single_node", "federation_ready": False}
+        return {"status": "single_node", "federation_ready": False, "federation": fed_status}
 
     @app.get("/cluster/identity")
     def cluster_identity() -> dict[str, Any]:
@@ -784,6 +934,83 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             except Exception:
                 pass
         return {}
+
+    # ── Federation preparation endpoints (stubs) ──────────────────────────────
+
+    @app.get("/federation/status")
+    def federation_status() -> dict[str, Any]:
+        if _federation_mod:
+            try:
+                return _federation_mod.get_federation_manager().status()
+            except Exception:
+                pass
+        return {"enabled": False, "status": "standalone"}
+
+    @app.get("/federation/peers")
+    def federation_peers() -> dict[str, Any]:
+        if _federation_mod:
+            try:
+                fm = _federation_mod.get_federation_manager()
+                return {"peers": fm.list_peers(), "status": fm.status()}
+            except Exception:
+                pass
+        return {"peers": []}
+
+    @app.post("/federation/register")
+    def federation_register(payload: dict[str, Any]) -> dict[str, Any]:
+        if _federation_mod:
+            try:
+                reg = _federation_mod.NodeRegistration(
+                    node_id=str(payload.get("node_id", "unknown")),
+                    region=str(payload.get("region", "unknown")),
+                    role=str(payload.get("role", "inference")),
+                    base_url=str(payload.get("base_url", "")),
+                    capabilities=dict(payload.get("capabilities") or {}),
+                    epoch_id=int(payload.get("epoch_id", 0)),
+                    coherence=float(payload.get("coherence", 1.0)),
+                )
+                return _federation_mod.get_federation_manager().register_peer(reg)
+            except Exception as exc:
+                return {"accepted": False, "error": str(exc)}
+        return {"accepted": False, "note": "federation module unavailable"}
+
+    @app.post("/federation/discover")
+    def federation_discover() -> dict[str, Any]:
+        if _federation_mod:
+            try:
+                return _federation_mod.get_federation_manager().discover_peers()
+            except Exception as exc:
+                return {"discovered": 0, "error": str(exc)}
+        return {"discovered": 0}
+
+    @app.post("/federation/heartbeat")
+    def federation_heartbeat() -> dict[str, Any]:
+        if _federation_mod:
+            try:
+                return _federation_mod.get_federation_manager().emit_heartbeat()
+            except Exception as exc:
+                return {"emitted_to": 0, "error": str(exc)}
+        return {"emitted_to": 0}
+
+    @app.post("/federation/governance/sync")
+    def federation_governance_sync(payload: dict[str, Any]) -> dict[str, Any]:
+        if _federation_mod:
+            try:
+                return _federation_mod.get_federation_manager().sync_governance(payload)
+            except Exception as exc:
+                return {"synced_to": 0, "error": str(exc)}
+        return {"synced_to": 0}
+
+    @app.post("/federation/epoch/sync")
+    def federation_epoch_sync(payload: dict[str, Any]) -> dict[str, Any]:
+        if _federation_mod:
+            try:
+                return _federation_mod.get_federation_manager().sync_epoch(
+                    int(payload.get("epoch_id", int(time.time())))
+                )
+            except Exception as exc:
+                return {"synced_to": 0, "error": str(exc)}
+        return {"synced_to": 0}
 
     # ── Compatibility prefix routes (unchanged) ────────────────────────────────
 

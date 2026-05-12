@@ -19,6 +19,7 @@ The server is no longer just a GGUF inference endpoint.  It has evolved into:
 | **Trading Bridge** | `app/trading_runtime_bridge.py` | niblit-lean-algos signal/regime integration |
 | **Event Bus** | `app/event_bus.py` | Structured events aligned with Niblit Ω.7 constants |
 | **Node Identity** | `app/node_identity.py` | Stable fingerprint, cluster/swarm readiness stubs |
+| **Federation Stubs** | `app/federation.py` | Node registration/discovery/heartbeat/governance sync stubs |
 
 ## Features
 
@@ -37,6 +38,8 @@ The server is no longer just a GGUF inference endpoint.  It has evolved into:
 - Trading cognition bridge (reads niblit-lean-algos signal files)
 - Structured event bus aligned with Niblit Phase Ω.7
 - Node identity + cluster readiness stubs for future swarm cognition
+- Federation preparation endpoints and runtime federation manager stubs
+- Portable runtime operations toolkit in `tools/`
 
 ## Quick start
 
@@ -117,6 +120,9 @@ See `.env.example` for all options.
 | `GET` | `/v1/runtime/reflection` | Reflection engine telemetry |
 | `GET` | `/v1/runtime/trading` | Trading cognition bridge state |
 | `GET` | `/v1/runtime/epoch` | Current epoch and coherence |
+| `GET` | `/v1/runtime/mode` | Runtime mode + resource adaptation posture |
+| `GET` | `/v1/runtime/node` | Node identity + federation posture |
+| `GET` | `/v1/runtime/diagnostics` | Runtime health/pressure/coherence/governance diagnostics |
 | `GET` | `/metrics/cognitive` | Cognitive telemetry metrics |
 | `GET` | `/metrics/coherence` | Coherence metrics |
 | `GET` | `/metrics/governance` | Governance metrics |
@@ -124,6 +130,13 @@ See `.env.example` for all options.
 | `GET` | `/cluster/status` | Cluster status (single-node) |
 | `GET` | `/cluster/identity` | Node identity |
 | `GET` | `/cluster/capabilities` | Node capabilities |
+| `GET` | `/federation/status` | Federation manager status (stub) |
+| `GET` | `/federation/peers` | Known peers (stub) |
+| `POST` | `/federation/register` | Node registration stub |
+| `POST` | `/federation/discover` | Cluster discovery stub |
+| `POST` | `/federation/heartbeat` | Runtime heartbeat stub |
+| `POST` | `/federation/governance/sync` | Governance synchronization stub |
+| `POST` | `/federation/epoch/sync` | Temporal epoch synchronization stub |
 
 ### Cognitive Envelope (optional)
 
@@ -154,9 +167,35 @@ See [architecture.md](architecture.md) for a full system diagram and layer descr
 
 See [deployment.md](deployment.md) for Docker, Fly.io, and HuggingFace Spaces instructions.
 
+## Runtime Operations Toolkit
+
+The repository now includes portable runtime tooling under `tools/`:
+
+- `tools/cloud_runtime_ctl.py` — governance-aware runtime control CLI (HTTP / UNIX socket / TCP admin transport)
+- `tools/lib/runtime_client.py` — reusable runtime client library for automation
+- `tools/install_runtime.sh` — portable backend installer (Fly.io, Docker, VPS, ARM, edge devices) with version pinning and checksum verification hooks
+- `tools/start_server.sh` — server start/stop/status/restart/smoke utility for operations runbooks
+
+These tools are designed for cloud/server operation and preserve compatibility with existing API routes.
+
+## Federation Roadmap (Preparation Phase)
+
+Current implementation is intentionally stubbed (no full federation yet):
+
+- ✅ Node registration interface
+- ✅ Cluster discovery interface
+- ✅ Capability advertisement
+- ✅ Runtime heartbeat interface
+- ✅ Governance sync interface
+- ✅ Temporal epoch sync interface
+- ⬜ Full peer networking protocol
+- ⬜ Consensus + trust-weighted governance replication
+- ⬜ Multi-node model orchestration
+
+This enables edge/phone/cloud hybrid topology planning without breaking existing deployments.
+
 ## Compatibility notes
 
 - All existing provider routes (`hf`, `local`, `kimi`, `claude`) continue to work.
 - The `model: "local"` alias from Niblit's `QwenLocalBrain` is still handled.
 - Constitutional governance is **strict by default** — set `NIBLIT_CG_STRICT=0` for permissive (log-only) mode during migration.
-

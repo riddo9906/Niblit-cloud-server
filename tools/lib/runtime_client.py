@@ -58,6 +58,8 @@ class RuntimeClient:
         timeout:        Request timeout in seconds.
         admin_token:    Optional bearer token for protected admin endpoints.
         unix_socket:    Path to UNIX domain socket (overrides HTTP transport).
+        tcp_host:       Optional TCP admin host (JSON-over-TCP transport).
+        tcp_port:       Optional TCP admin port.
     """
 
     def __init__(
@@ -66,11 +68,15 @@ class RuntimeClient:
         timeout: int = DEFAULT_TIMEOUT,
         admin_token: str = "",
         unix_socket: str = "",
+        tcp_host: str = "",
+        tcp_port: int = 0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.admin_token = admin_token
         self.unix_socket = unix_socket
+        self.tcp_host = tcp_host
+        self.tcp_port = tcp_port
 
     # ── Probe endpoints ────────────────────────────────────────────────────────
 
@@ -91,6 +97,10 @@ class RuntimeClient:
     def runtime_status(self) -> RuntimeResponse:
         """GET /v1/runtime/status — full runtime snapshot."""
         return self._get("/v1/runtime/status")
+
+    def runtime_mode(self) -> RuntimeResponse:
+        """GET /v1/runtime/mode — runtime mode + adaptation posture."""
+        return self._get("/v1/runtime/mode")
 
     def coherence(self) -> RuntimeResponse:
         """GET /v1/runtime/coherence — temporal coherence state."""
@@ -153,6 +163,10 @@ class RuntimeClient:
     def cluster_identity(self) -> RuntimeResponse:
         """GET /cluster/identity — node identity."""
         return self._get("/cluster/identity")
+
+    def node_identity(self) -> RuntimeResponse:
+        """GET /v1/runtime/node — runtime node identity."""
+        return self._get("/v1/runtime/node")
 
     def cluster_capabilities(self) -> RuntimeResponse:
         """GET /cluster/capabilities — node capabilities."""
@@ -219,6 +233,7 @@ class RuntimeClient:
         for name, method in [
             ("health", self.health),
             ("runtime", self.runtime_status),
+            ("runtime_mode", self.runtime_mode),
             ("coherence", self.coherence),
             ("governance", self.governance),
             ("attention", self.attention),
@@ -252,6 +267,8 @@ class RuntimeClient:
     ) -> RuntimeResponse:
         if self.unix_socket:
             return self._unix_request(method, path, body)
+        if self.tcp_host and self.tcp_port > 0:
+            return self._tcp_request(method, path, body)
         return self._http_request(method, path, body)
 
     def _http_request(
@@ -347,6 +364,47 @@ class RuntimeClient:
                 ok=(200 <= status_code < 300),
                 status_code=status_code,
                 data=parsed_body,
+                url=url,
+            )
+        except Exception as exc:
+            return RuntimeResponse(
+                ok=False, status_code=0, data={}, error=str(exc), url=url
+            )
+
+    def _tcp_request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None,
+    ) -> RuntimeResponse:
+        """JSON-over-TCP admin request transport."""
+        url = f"tcp://{self.tcp_host}:{self.tcp_port}{path}"
+        payload = {
+            "method": method,
+            "path": path,
+            "body": body or {},
+            "token": self.admin_token,
+        }
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            sock.connect((self.tcp_host, self.tcp_port))
+            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            raw = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+            sock.close()
+            text = raw.decode("utf-8").strip()
+            data = json.loads(text) if text else {}
+            status_code = int(data.get("status_code", 200))
+            return RuntimeResponse(
+                ok=(200 <= status_code < 300),
+                status_code=status_code,
+                data=data.get("data", data),
+                error=str(data.get("error", "")),
                 url=url,
             )
         except Exception as exc:

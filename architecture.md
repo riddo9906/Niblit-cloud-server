@@ -179,6 +179,30 @@ Response
 - `cluster_status()` returns single-node status (federation not yet implemented)
 - Emits `EVENT_NODE_IDENTITY_SET` on init
 
+### `app/federation.py` — Federation Preparation Stubs
+- Defines portable federation interfaces without full distributed execution:
+  - node registration
+  - cluster discovery
+  - capability advertisement
+  - runtime heartbeat
+  - governance synchronization
+  - temporal epoch synchronization
+- In-memory stub manager (`FederationManager`) preserves interface contracts for future rollout
+- Exposed via `/federation/*` endpoints and integrated into `/cluster/status`
+
+## Runtime Diagnostics Surface
+
+`GET /v1/runtime/diagnostics` aggregates governance-aware operational telemetry:
+
+- runtime health
+- inference pressure / attention pressure
+- model latency EMA map
+- governance violation counters
+- thermal/resource adaptation state
+- reflection statistics
+- coherence drift
+- federation status (stub)
+
 ## Constitutional Laws (aligned with Niblit)
 
 | Law | Condition that triggers violation |
@@ -228,8 +252,17 @@ Phase Ω.7 prepares architecture for future distributed cognition without implem
 - ✅ Node identity + fingerprinting
 - ✅ Capability advertisement
 - ✅ `/cluster/status`, `/cluster/identity`, `/cluster/capabilities` endpoints
+- ✅ `/federation/status`, `/federation/peers`, `/federation/register`, `/federation/discover`, `/federation/heartbeat`, `/federation/governance/sync`, `/federation/epoch/sync`
 - ⬜ Node-to-node trust protocol
 - ⬜ Distributed signal aggregation
 - ⬜ Swarm consensus layer
 - ⬜ Federated model routing
 - ⬜ Distributed reflection synchronization
+
+## Portable Runtime Tooling Layer
+
+Operational tooling in `tools/` supports remote orchestration across cloud and edge:
+
+- `cloud_runtime_ctl.py` (CLI) + `lib/runtime_client.py` (reusable API client)
+- `install_runtime.sh` portable installer with version pinning and integrity checks
+- `start_server.sh` lifecycle and smoke tooling for runtime operators

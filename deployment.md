@@ -36,6 +36,48 @@ fly deploy
 
 See `fly.toml` for machine configuration.
 
+## Portable Runtime Toolkit (Cloud / VPS / ARM / Edge)
+
+The `tools/` directory provides portable operational tooling:
+
+```bash
+# Install runtime backend (llama-server default)
+./tools/install_runtime.sh local-linux llama-server
+
+# Alternative targets
+./tools/install_runtime.sh flyio llama-server
+./tools/install_runtime.sh docker llama-cli
+./tools/install_runtime.sh arm-server llama-server
+./tools/install_runtime.sh edge-arm llama-cli
+```
+
+Version pinning and integrity:
+
+```bash
+export LLAMA_CPP_VERSION=b5380
+export LLAMA_SERVER_URL="https://example.com/llama-server"
+export LLAMA_SERVER_SHA256="<sha256>"
+./tools/install_runtime.sh vps llama-server
+```
+
+Runtime operations:
+
+```bash
+./tools/start_server.sh start
+./tools/start_server.sh status
+./tools/start_server.sh smoke
+./tools/start_server.sh stop
+```
+
+Runtime control:
+
+```bash
+python tools/cloud_runtime_ctl.py --url http://127.0.0.1:8000 status
+python tools/cloud_runtime_ctl.py --url http://127.0.0.1:8000 diagnostics
+python tools/cloud_runtime_ctl.py --socket /tmp/niblit-runtime.sock health
+python tools/cloud_runtime_ctl.py --tcp-host 127.0.0.1 --tcp-port 9009 cluster
+```
+
 ## HuggingFace Spaces
 
 1. Set repository type to **Docker**.
@@ -113,6 +155,15 @@ See `fly.toml` for machine configuration.
 | `NIBLIT_NODE_REGION` | `local` | Geographic region hint |
 | `NIBLIT_NODE_ROLE` | `inference` | Node role for future federation |
 
+### Federation Preparation
+
+| Variable | Default | Description |
+|---|---|---|
+| `NIBLIT_FEDERATION_ENABLED` | `0` | Enable federation stubs in status surfaces |
+| `NIBLIT_FEDERATION_REGISTRY` | `` | Registry URL placeholder for future federation |
+| `NIBLIT_FEDERATION_MAX_PEERS` | `8` | Max peers placeholder |
+| `NIBLIT_HEARTBEAT_INTERVAL` | `30` | Heartbeat interval placeholder |
+
 ## Connecting niblit-lean-algos
 
 When running niblit-lean-algos alongside this server, set the signal file
@@ -143,6 +194,15 @@ Phase Ω.7 features:
 4. Set `NIBLIT_CG_STRICT=0` initially if you want permissive governance while
    calibrating coherence thresholds.
 5. Check `/metrics/governance` for veto rate before enabling strict mode.
+
+## Hybrid Edge/Phone/Cloud Topology (Preparation)
+
+Recommended future topology (supported operationally by current tooling):
+
+- phone/edge local runtime using `llama-cli` + UNIX/TCP control transport
+- cloud runtime using HTTP admin mode and governance diagnostics
+- shared governance semantics (Ω.7 cognitive envelope) across all nodes
+- staged federation rollout via `/federation/*` interfaces (currently stubs)
 
 ## Running Tests
 

@@ -49,6 +49,7 @@ class NodeCapabilities:
     supports_governance: bool = True
     supports_temporal_sync: bool = True
     supports_reflection: bool = True
+    supports_federation_stub: bool = True
     swarm_ready: bool = False          # federation not yet implemented
     api_version: str = "omega.7"
 
@@ -61,6 +62,7 @@ class NodeCapabilities:
             "supports_governance": self.supports_governance,
             "supports_temporal_sync": self.supports_temporal_sync,
             "supports_reflection": self.supports_reflection,
+            "supports_federation_stub": self.supports_federation_stub,
             "swarm_ready": self.swarm_ready,
             "api_version": self.api_version,
         }
@@ -127,12 +129,20 @@ class NodeIdentity:
     def cluster_status(self) -> dict[str, Any]:
         """Return cluster status (single-node — federation not implemented)."""
         snap = self.snapshot()
+        federation: dict[str, Any] = {}
+        try:
+            from app.federation import get_federation_manager
+
+            federation = get_federation_manager().status()
+        except Exception:
+            federation = {}
         return {
             "status": "single_node",
             "federation_ready": False,
             "note": "Distributed swarm federation is not yet implemented. "
                     "This node is operating in standalone mode.",
             "node": snap.to_dict(),
+            "federation": federation,
         }
 
     def _emit_init(self) -> None:

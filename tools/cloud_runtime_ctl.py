@@ -13,10 +13,12 @@ Commands
     health              — liveness probe
     status              — full runtime snapshot (all subsystems)
     coherence           — temporal coherence state
+    mode                — current runtime mode
     governance          — constitutional governance stats
     attention           — attention economy metrics
     models              — model orchestration health
     reflection          — reflection engine telemetry
+    node                — runtime node identity
     trading             — trading cognition bridge state
     epoch               — current epoch
     cluster             — cluster / federation status
@@ -30,6 +32,7 @@ Environment variables
     NIBLIT_CLOUD_URL    — runtime base URL (default: http://localhost:8000)
     NIBLIT_ADMIN_TOKEN  — bearer token for authenticated endpoints
     NIBLIT_UNIX_SOCKET  — UNIX domain socket path (overrides HTTP)
+    NIBLIT_TCP_ADMIN_HOST / NIBLIT_TCP_ADMIN_PORT — optional TCP admin control transport
 """
 
 from __future__ import annotations
@@ -148,10 +151,12 @@ def cmd_status(client: RuntimeClient) -> int:
 def cmd_single(client: RuntimeClient, command: str) -> int:
     dispatch = {
         "coherence": client.coherence,
+        "mode": client.runtime_mode,
         "governance": client.governance,
         "attention": client.attention,
         "models": client.models,
         "reflection": client.reflection,
+        "node": client.node_identity,
         "trading": client.trading,
         "epoch": client.epoch,
         "cluster": client.cluster_status,
@@ -238,6 +243,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="UNIX domain socket path (overrides HTTP transport)",
     )
     parser.add_argument(
+        "--tcp-host",
+        default=os.getenv("NIBLIT_TCP_ADMIN_HOST", ""),
+        help="TCP admin host (requires --tcp-port)",
+    )
+    parser.add_argument(
+        "--tcp-port",
+        type=int,
+        default=int(os.getenv("NIBLIT_TCP_ADMIN_PORT", "0")),
+        help="TCP admin port for JSON-over-TCP control transport",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=15,
@@ -255,10 +271,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("health",      help="Liveness probe")
     sub.add_parser("status",      help="Full runtime snapshot")
     sub.add_parser("coherence",   help="Temporal coherence state")
+    sub.add_parser("mode",        help="Runtime mode and adaptation posture")
     sub.add_parser("governance",  help="Constitutional governance stats")
     sub.add_parser("attention",   help="Attention economy metrics")
     sub.add_parser("models",      help="Model orchestration health")
     sub.add_parser("reflection",  help="Reflection engine telemetry")
+    sub.add_parser("node",        help="Runtime node identity and federation posture")
     sub.add_parser("trading",     help="Trading cognition bridge state")
     sub.add_parser("epoch",       help="Current epoch and coherence")
     sub.add_parser("cluster",     help="Cluster / federation status")
@@ -288,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
         timeout=args.timeout,
         admin_token=args.token,
         unix_socket=args.socket,
+        tcp_host=args.tcp_host,
+        tcp_port=args.tcp_port,
     )
 
     cmd = args.command
@@ -306,8 +326,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_chat(client, args.message)
     if cmd == "watch":
         return cmd_watch(client, args.interval)
-    if cmd in ("coherence", "governance", "attention", "models", "reflection",
-               "trading", "epoch", "cluster", "diagnostics"):
+    if cmd in ("coherence", "mode", "governance", "attention", "models", "reflection",
+               "node", "trading", "epoch", "cluster", "diagnostics"):
         return cmd_single(client, cmd)
 
     parser.print_help()
