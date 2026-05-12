@@ -218,7 +218,7 @@ _probe_readiness() {
     fi
     # Check process is still alive
     if [[ -f "$_PID_FILE" ]] && ! kill -0 "$(cat "$_PID_FILE")" 2>/dev/null; then
-      echo "[niblit-termux] ❌ server process died — check $LOG_FILE" >&2
+      echo "[niblit-termux] ❌ server process died — check $_LOG_FILE" >&2
       return 1
     fi
     sleep 2
