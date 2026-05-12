@@ -1,0 +1,114 @@
+name: Deployment Validation
+
+# Pre-deployment validation for the Niblit Cognitive Cloud Runtime.
+# Validates server imports, API compatibility, and deployment readiness.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: deploy-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Pre-deployment validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check — app/main.py
+        run: python -m py_compile app/main.py
+
+      - name: Syntax check — all app modules
+        run: |
+          for f in app/*.py; do
+            python -m py_compile "$f" && echo "  OK: $f" || { echo "  FAIL: $f"; exit 1; }
+          done
+
+      - name: Check .env.example exists
+        run: test -f .env.example && echo ".env.example found"
+
+      - name: Validate .env.example contains required vars
+        run: |
+          python - <<'EOF'
+          with open('.env.example') as f:
+              content = f.read()
+          required = ['NIBLIT_NODE_REGION', 'NIBLIT_NODE_ROLE']
+          missing = [v for v in required if v not in content]
+          if missing:
+              print(f"Missing from .env.example: {missing}")
+              raise SystemExit(1)
+          print("All required variables documented in .env.example")
+          EOF
+
+      - name: Validate app.main imports cleanly (stub engine)
+        run: |
+          python -c "
+          import sys, os
+          from app.main import create_app, ModelManager, ModelEngineResult
+          print('app.main imports cleanly')
+          app = create_app(ModelManager(model_map={'local': '/tmp/test.gguf'}, default_model='local'))
+          print('create_app: OK')
+          "
+
+      - name: Validate all Ω.7 cognitive modules import cleanly
+        run: |
+          python - <<'EOF'
+          import importlib
+          modules = [
+              'app.event_bus', 'app.cognitive_envelope', 'app.cloud_governance',
+              'app.temporal_sync', 'app.reflection_engine', 'app.model_orchestrator',
+              'app.attention_allocator', 'app.trading_runtime_bridge',
+              'app.node_identity', 'app.federation',
+          ]
+          for m in modules:
+              importlib.import_module(m)
+              print(f"  OK: {m}")
+          print("All Ω.7 modules import cleanly")
+          EOF
+
+      - name: Run backward-compatibility test suite
+        run: python -m pytest tests/test_api.py -q --tb=short
+
+      - name: Validate fly.toml is valid TOML
+        run: |
+          python - <<'EOF'
+          try:
+              import tomllib
+          except ImportError:
+              import tomli as tomllib  # type: ignore[no-redef]
+          with open('fly.toml', 'rb') as f:
+              data = tomllib.load(f)
+          print(f"fly.toml valid: app={data.get('app', '?')}")
+          EOF
+        continue-on-error: true  # fly.toml validation is advisory
+
+      - name: Validate Dockerfile exists
+        run: test -f Dockerfile && echo "Dockerfile found"

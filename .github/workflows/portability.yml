@@ -1,0 +1,116 @@
+name: Portability Check
+
+# Validates that the runtime tooling is portable across supported platforms.
+# Checks for Termux-compatibility, ARM-safe code, and proper profile coverage.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'tools/**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: portability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portability:
+    name: Portability validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check no platform-specific stdlib imports in lib/
+        run: |
+          python - <<'EOF'
+          import ast, os
+          # These imports should not appear in shared tooling lib files
+          RESTRICTED = ["winreg", "msvcrt", "readline"]
+          errors = []
+          for root, dirs, files in os.walk('tools/lib'):
+              dirs[:] = [d for d in dirs if d not in ['__pycache__']]
+              for f in files:
+                  if f.endswith('.py'):
+                      path = os.path.join(root, f)
+                      with open(path) as fh:
+                          tree = ast.parse(fh.read())
+                      for node in ast.walk(tree):
+                          if isinstance(node, (ast.Import, ast.ImportFrom)):
+                              names = [a.name for a in getattr(node, 'names', [])]
+                              mod = getattr(node, 'module', '') or ''
+                              for name in names + [mod]:
+                                  if name and name.split('.')[0] in RESTRICTED:
+                                      errors.append(f"{path}: restricted import: {name}")
+          if errors:
+              for e in errors: print(f"FAIL: {e}")
+              raise SystemExit(1)
+          print("No platform-restricted imports found in tools/lib/")
+          EOF
+
+      - name: Validate termux-local profile is self-consistent
+        run: |
+          python - <<'EOF'
+          from tools.lib.runtime_profiles import get_profile_env, profile_summary
+          env = get_profile_env("termux-local")
+          summary = profile_summary("termux-local")
+          # Termux profile must use minimal resource class
+          assert summary["resource_class"] == "minimal", f"expected minimal resource class, got: {summary['resource_class']}"
+          # Must have UNIX socket configured
+          assert env.get("NIBLIT_UNIX_SOCKET"), "termux-local profile missing UNIX socket"
+          # Context window must be <= 4096 (edge constraint)
+          n_ctx = int(env.get("NIBLIT_N_CTX", "0"))
+          assert n_ctx <= 4096, f"n_ctx too large for termux: {n_ctx}"
+          print(f"termux-local profile portability OK (n_ctx={n_ctx}, socket={env['NIBLIT_UNIX_SOCKET']})")
+          EOF
+
+      - name: Validate install_local_runtime.py is importable on all paths
+        run: |
+          python -c "
+          from tools.install_local_runtime import detect_platform, validate_backend, validate_env
+          pf = detect_platform()
+          print(f'Platform detection OK: os={pf[\"os\"]} arch={pf[\"arch\"]} is_termux={pf[\"is_termux\"]}')
+          env_result = validate_env()
+          print(f'Environment validation OK: missing_recommended={env_result[\"missing_recommended\"]}')
+          "
+
+      - name: Validate sidecar_client env factory
+        run: |
+          python -c "
+          from tools.lib.sidecar_client import from_env, SidecarClient
+          client = from_env()
+          assert isinstance(client, SidecarClient)
+          print('from_env() factory OK')
+          "
+
+      - name: Check all shell scripts use set -euo pipefail
+        run: |
+          echo "Checking shell scripts for safety flags..."
+          SCRIPTS=$(find tools/ -name "*.sh" -type f)
+          for f in $SCRIPTS; do
+            if grep -q "set -euo pipefail" "$f"; then
+              echo "  OK: $f"
+            else
+              echo "  WARN: $f missing 'set -euo pipefail'"
+            fi
+          done
+          echo "Shell safety flag check complete"

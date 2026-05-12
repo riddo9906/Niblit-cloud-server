@@ -1,0 +1,138 @@
+name: Anti-Drift Check
+
+# Prevents architectural drift between the cloud-server runtime and the
+# Niblit ecosystem.  Validates:
+# - Schema-v2 envelope field alignment
+# - Governance mode naming (Ω.7 constants)
+# - Event type constant naming
+# - Protocol version constants
+# - Profile completeness
+# - Naming drift detection
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - 'tools/**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: anti-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  anti-drift:
+    name: Schema / governance / tooling anti-drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check governance mode alignment (Ω.7)
+        run: |
+          python - <<'EOF'
+          # Validate that governance modes used in tooling match Ω.7 constants
+          EXPECTED_MODES = {"normal", "cautious", "survival", "lockdown", "minimal"}
+          from tools.lib.sidecar_client import GOVERNANCE_MODES
+          drift = EXPECTED_MODES.symmetric_difference(GOVERNANCE_MODES)
+          if drift:
+              print(f"GOVERNANCE_MODE DRIFT DETECTED: {drift}")
+              raise SystemExit(1)
+          print(f"Governance modes aligned: {sorted(GOVERNANCE_MODES)}")
+          EOF
+
+      - name: Check event bus constants exist
+        run: |
+          python - <<'EOF'
+          from app.event_bus import (
+              EVENT_ROUTING_DECISION, EVENT_MODEL_FALLBACK, EVENT_MODEL_FAILURE,
+              EVENT_REFLECTION_COMPLETE, EVENT_NODE_IDENTITY_SET,
+          )
+          print("Event bus constants OK")
+          EOF
+
+      - name: Check schema-v2 envelope field normalization
+        run: |
+          python - <<'EOF'
+          from tools.lib.sidecar_client import normalize_envelope, INTENT_TYPES
+          # Verify required Ω.7 fields are normalized
+          envelope = {
+              "intent": "trading",
+              "coherence_score": 0.9,
+              "attention_budget": 0.8,
+              "governance": {"governance_mode": "normal"},
+          }
+          result = normalize_envelope(envelope)
+          assert result["intent"] == "trading", "intent not preserved"
+          assert result["coherence_score"] == 0.9, "coherence_score not preserved"
+          assert result["governance"]["governance_mode"] == "normal", "governance mode drift"
+          print("Schema-v2 envelope normalization OK")
+
+          # Verify unknown governance mode is normalized to 'normal'
+          bad = normalize_envelope({"governance": {"governance_mode": "unknown_mode"}})
+          assert bad["governance"]["governance_mode"] == "normal", "bad mode not normalized"
+          print("Unknown governance mode normalization OK")
+          EOF
+
+      - name: Check profile completeness
+        run: |
+          python - <<'EOF'
+          from tools.lib.runtime_profiles import list_profiles, KNOWN_PROFILES, profile_summary
+          for profile in KNOWN_PROFILES:
+              summary = profile_summary(profile)
+              assert "error" not in summary, f"Profile '{profile}' has error: {summary}"
+              required_keys = ["runtime_mode", "governance_strict", "resource_class"]
+              for k in required_keys:
+                  assert k in summary, f"Profile '{profile}' missing key: {k}"
+              print(f"  OK: {profile} (mode={summary['runtime_mode']}, resource={summary['resource_class']})")
+          print("All profiles complete")
+          EOF
+
+      - name: Check no hardcoded cloud-only assumptions in tooling
+        run: |
+          python - <<'EOF'
+          import ast, os, sys
+          CLOUD_ONLY_PATTERNS = ["fly.io", "flyio", "fly-production"]
+          errors = []
+          for root, dirs, files in os.walk('tools'):
+              dirs[:] = [d for d in dirs if d not in ['__pycache__', '.git']]
+              for f in files:
+                  if f.endswith('.py'):
+                      path = os.path.join(root, f)
+                      with open(path) as fh:
+                          content = fh.read()
+                      for pattern in CLOUD_ONLY_PATTERNS:
+                          if pattern in content.lower():
+                              errors.append(f"{path}: contains cloud-only assumption: '{pattern}'")
+          if errors:
+              for e in errors: print(f"WARN: {e}")
+              # Advisory only — not a blocking failure
+          print(f"Cloud-only assumption check complete ({len(errors)} advisory warnings)")
+          EOF
+
+      - name: Validate protocol version constant
+        run: |
+          python -c "
+          from tools.lib.sidecar_client import SIDECAR_PROTOCOL_VERSION
+          assert SIDECAR_PROTOCOL_VERSION.startswith('sidecar/'), f'unexpected protocol version: {SIDECAR_PROTOCOL_VERSION}'
+          print(f'Protocol version: {SIDECAR_PROTOCOL_VERSION}')
+          "
