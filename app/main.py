@@ -970,8 +970,9 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                     coherence=float(payload.get("coherence", 1.0)),
                 )
                 return _federation_mod.get_federation_manager().register_peer(reg)
-            except Exception as exc:
-                return {"accepted": False, "error": str(exc)}
+            except Exception:
+                logger.exception("federation_register failed")
+                return {"accepted": False, "error": "federation_register_failed"}
         return {"accepted": False, "note": "federation module unavailable"}
 
     @app.post("/federation/discover")
@@ -979,8 +980,9 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         if _federation_mod:
             try:
                 return _federation_mod.get_federation_manager().discover_peers()
-            except Exception as exc:
-                return {"discovered": 0, "error": str(exc)}
+            except Exception:
+                logger.exception("federation_discover failed")
+                return {"discovered": 0, "error": "federation_discover_failed"}
         return {"discovered": 0}
 
     @app.post("/federation/heartbeat")
@@ -988,8 +990,9 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         if _federation_mod:
             try:
                 return _federation_mod.get_federation_manager().emit_heartbeat()
-            except Exception as exc:
-                return {"emitted_to": 0, "error": str(exc)}
+            except Exception:
+                logger.exception("federation_heartbeat failed")
+                return {"emitted_to": 0, "error": "federation_heartbeat_failed"}
         return {"emitted_to": 0}
 
     @app.post("/federation/governance/sync")
@@ -997,8 +1000,9 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         if _federation_mod:
             try:
                 return _federation_mod.get_federation_manager().sync_governance(payload)
-            except Exception as exc:
-                return {"synced_to": 0, "error": str(exc)}
+            except Exception:
+                logger.exception("federation_governance_sync failed")
+                return {"synced_to": 0, "error": "federation_governance_sync_failed"}
         return {"synced_to": 0}
 
     @app.post("/federation/epoch/sync")
@@ -1008,8 +1012,9 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 return _federation_mod.get_federation_manager().sync_epoch(
                     int(payload.get("epoch_id", int(time.time())))
                 )
-            except Exception as exc:
-                return {"synced_to": 0, "error": str(exc)}
+            except Exception:
+                logger.exception("federation_epoch_sync failed")
+                return {"synced_to": 0, "error": "federation_epoch_sync_failed"}
         return {"synced_to": 0}
 
     # ── Compatibility prefix routes (unchanged) ────────────────────────────────

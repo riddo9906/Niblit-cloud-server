@@ -210,5 +210,5 @@ Recommended future topology (supported operationally by current tooling):
 python -m pytest -q
 ```
 
-All 85 tests should pass.  Original 13 backward-compatibility tests are
+All 92 tests should pass.  Original 13 backward-compatibility tests are
 preserved unchanged.
