@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -159,6 +160,44 @@ class TestRuntimeProfiles:
 
         monkeypatch.setenv("NIBLIT_PROFILE", "termux-local")
         assert active_profile() == "termux-local"
+
+    def test_termux_inference_server_dry_run_resolves_termux_defaults(self, tmp_path):
+        repo_root = Path(__file__).parent.parent
+        termux_home = tmp_path / "termux-home"
+        model_dir = termux_home / "models"
+        backend_bin = termux_home / "llama.cpp" / "build" / "bin" / "llama-server"
+        tmp_runtime = tmp_path / "tmp"
+
+        model_dir.mkdir(parents=True)
+        backend_bin.parent.mkdir(parents=True)
+        tmp_runtime.mkdir()
+
+        model_path = model_dir / "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+        model_path.write_bytes(b"GGUF" + b"\x00" * 128)
+        backend_bin.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        backend_bin.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(termux_home),
+            "PREFIX": "/data/data/com.termux/files/usr",
+            "TMPDIR": str(tmp_runtime),
+        })
+        env.pop("NIBLIT_MODEL_PATH", None)
+        env.pop("NIBLIT_LLAMA_SERVER_BIN", None)
+
+        result = subprocess.run(
+            ["bash", str(repo_root / "tools/termux_inference_server.sh"), "--profile", "termux-local", "--dry-run"],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert str(model_path) in result.stdout
+        assert str(backend_bin) in result.stdout
 
 
 # ── Sidecar client ─────────────────────────────────────────────────────────────
