@@ -197,8 +197,8 @@ Canonical governance modes: `normal`, `cautious`, `survival`, `lockdown`, `minim
 ./tools/install_llama_server.sh --backend llama-server
 
 # 2. Launch inference server
-NIBLIT_MODEL_PATH=~/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
-  ./tools/termux_inference_server.sh --profile termux-local
+# termux-local auto-resolves ~/models/*.gguf and ~/llama.cpp/build/bin/llama-server
+./tools/termux_inference_server.sh --profile termux-local
 
 # 3. With cloudflared tunnel
 ./tools/termux_inference_server.sh \

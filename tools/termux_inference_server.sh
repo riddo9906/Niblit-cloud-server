@@ -78,9 +78,24 @@ _find_model_in_dir() {
   return 1
 }
 
+_expand_path_tokens() {
+  local value="$1"
+  local home_dir="${HOME:-/data/data/com.termux/files/home}"
+  local termux_home="${TERMUX_HOME:-$home_dir}"
+
+  value="${value//\$\{TERMUX_HOME\}/$termux_home}"
+  value="${value//\$TERMUX_HOME/$termux_home}"
+  value="${value//\$\{HOME\}/$home_dir}"
+  value="${value//\$HOME/$home_dir}"
+
+  printf '%s\n' "$value"
+}
+
 _resolve_model_path() {
   local original_model_path="${MODEL_PATH:-}"
   local candidate_dir resolved=""
+
+  MODEL_PATH="$(_expand_path_tokens "$MODEL_PATH")"
 
   if [[ -n "$MODEL_PATH" && -d "$MODEL_PATH" ]]; then
     resolved="$(_find_model_in_dir "$MODEL_PATH")"
@@ -105,6 +120,8 @@ _resolve_model_path() {
 _resolve_backend_bin() {
   local original_backend_bin="${BACKEND_BIN:-}"
   local candidate resolved=""
+
+  BACKEND_BIN="$(_expand_path_tokens "$BACKEND_BIN")"
 
   if [[ -n "$BACKEND_BIN" && "$BACKEND_BIN" == */* && -x "$BACKEND_BIN" ]]; then
     return 0
