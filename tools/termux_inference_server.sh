@@ -65,9 +65,19 @@ READINESS_TIMEOUT=60
 _find_model_in_dir() {
   local dir="$1"
   local pattern resolved
+  local -a patterns=(
+    "*qwen*.gguf"
+    "*llama*.gguf"
+    "*mistral*.gguf"
+    "*mixtral*.gguf"
+    "*phi*.gguf"
+    "*gemma*.gguf"
+    "*deepseek*.gguf"
+    "*.gguf"
+  )
   [[ -d "$dir" ]] || return 1
 
-  for pattern in "*qwen*.gguf" "*llama*.gguf" "*.gguf"; do
+  for pattern in "${patterns[@]}"; do
     resolved="$(find "$dir" -maxdepth 1 -type f -iname "$pattern" | LC_ALL=C sort | head -n 1 || true)"
     if [[ -n "$resolved" ]]; then
       printf '%s\n' "$resolved"

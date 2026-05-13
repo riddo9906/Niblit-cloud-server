@@ -162,6 +162,7 @@ class TestRuntimeProfiles:
         assert active_profile() == "termux-local"
 
     def test_termux_inference_server_dry_run_resolves_termux_defaults(self, tmp_path):
+        model_padding_bytes = 128
         repo_root = Path(__file__).parent.parent
         termux_home = tmp_path / "termux-home"
         model_dir = termux_home / "models"
@@ -173,7 +174,7 @@ class TestRuntimeProfiles:
         tmp_runtime.mkdir()
 
         model_path = model_dir / "qwen2.5-0.5b-instruct-q4_k_m.gguf"
-        model_path.write_bytes(b"GGUF" + b"\x00" * 128)
+        model_path.write_bytes(b"GGUF" + b"\x00" * model_padding_bytes)
         backend_bin.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         backend_bin.chmod(0o755)
 
