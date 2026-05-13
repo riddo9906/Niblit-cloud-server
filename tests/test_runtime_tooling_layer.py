@@ -162,7 +162,7 @@ class TestRuntimeProfiles:
         assert active_profile() == "termux-local"
 
     def test_termux_inference_server_dry_run_resolves_termux_defaults(self, tmp_path):
-        # Keep the GGUF stub larger than the header so the launcher reads it as a real file.
+        # Keep the GGUF stub larger than the 4-byte GGUF header so the launcher sees a non-empty model file.
         model_stub_size = 128
         repo_root = Path(__file__).parent.parent
         termux_home = tmp_path / "termux-home"

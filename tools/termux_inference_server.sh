@@ -116,10 +116,7 @@ _resolve_model_path() {
   if [[ -n "$MODEL_PATH" && -d "$MODEL_PATH" ]]; then
     resolved="$(_find_model_in_dir "$MODEL_PATH")"
   elif [[ -z "$MODEL_PATH" ]]; then
-    for candidate_dir in \
-      "${HOME:-/data/data/com.termux/files/home}/models" \
-      "/data/data/com.termux/files/home/models"
-    do
+    for candidate_dir in "${HOME:-/data/data/com.termux/files/home}/models"; do
       resolved="$(_find_model_in_dir "$candidate_dir")"
       [[ -n "$resolved" ]] && break
     done
@@ -148,10 +145,7 @@ _resolve_backend_bin() {
     return 0
   fi
 
-  for candidate in \
-    "${HOME:-/data/data/com.termux/files/home}/llama.cpp/build/bin/llama-server" \
-    "/data/data/com.termux/files/home/llama.cpp/build/bin/llama-server"
-  do
+  for candidate in "${HOME:-/data/data/com.termux/files/home}/llama.cpp/build/bin/llama-server"; do
     if [[ -x "$candidate" ]]; then
       resolved="$candidate"
       break
