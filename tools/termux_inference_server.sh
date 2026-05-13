@@ -64,7 +64,7 @@ READINESS_TIMEOUT=60
 
 _find_model_in_dir() {
   local dir="$1"
-  local pattern resolved
+  local pattern candidate
   local -a patterns=(
     "*qwen*.gguf"
     "*llama*.gguf"
@@ -75,14 +75,18 @@ _find_model_in_dir() {
     "*deepseek*.gguf"
     "*.gguf"
   )
+  local -a candidates=()
   [[ -d "$dir" ]] || return 1
 
+  mapfile -t candidates < <(find "$dir" -maxdepth 1 -type f -iname "*.gguf" | LC_ALL=C sort)
+
   for pattern in "${patterns[@]}"; do
-    resolved="$(find "$dir" -maxdepth 1 -type f -iname "$pattern" | LC_ALL=C sort | head -n 1 || true)"
-    if [[ -n "$resolved" ]]; then
-      printf '%s\n' "$resolved"
-      return 0
-    fi
+    for candidate in "${candidates[@]}"; do
+      if [[ "${candidate##*/,,}" == $pattern ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
   done
 
   return 1
@@ -122,7 +126,7 @@ _resolve_model_path() {
   if [[ -n "$resolved" ]]; then
     MODEL_PATH="$resolved"
     if [[ "$MODEL_PATH" != "$original_model_path" ]]; then
-      echo "[niblit-termux] resolved model path: $MODEL_PATH"
+      echo "[niblit-termux] resolved model path: $MODEL_PATH" >&2
     fi
   fi
 }
@@ -155,7 +159,7 @@ _resolve_backend_bin() {
   if [[ -n "$resolved" ]]; then
     BACKEND_BIN="$resolved"
     if [[ "$BACKEND_BIN" != "$original_backend_bin" ]]; then
-      echo "[niblit-termux] resolved backend binary: $BACKEND_BIN"
+      echo "[niblit-termux] resolved backend binary: $BACKEND_BIN" >&2
     fi
   fi
 }
