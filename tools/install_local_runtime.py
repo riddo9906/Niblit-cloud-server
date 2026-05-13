@@ -64,12 +64,49 @@ DEFAULT_PORT = 8000
 
 
 def detect_platform() -> dict[str, Any]:
-    """Detect the current runtime platform and capabilities."""
+    """Detect the current runtime platform and capabilities.
+
+    Detection order (priority):
+    1. CI / container / virtualisation signals are evaluated first.
+       When any CI/container indicator is present, ``is_termux`` is forced to
+       ``False`` regardless of path heuristics.
+    2. Only when no CI/container indicator is found are Termux-specific
+       signals evaluated (PREFIX, TERMUX_VERSION, filesystem paths).
+
+    This guarantees deterministic, governance-safe classification across CI,
+    Docker, Kubernetes, and live Termux environments.
+    """
     uname = platform.uname()
-    is_termux = "com.termux" in os.environ.get("PREFIX", "") or \
-                "/data/data/com.termux" in os.environ.get("HOME", "")
-    is_container = Path("/.dockerenv").exists() or \
-                   bool(os.environ.get("KUBERNETES_SERVICE_HOST"))
+
+    # ── Step 1: CI / container detection (highest priority) ──────────────────
+    _is_ci = bool(
+        os.environ.get("CI")
+        or os.environ.get("GITHUB_ACTIONS")
+        or os.environ.get("GITLAB_CI")
+        or os.environ.get("CIRCLECI")
+        or os.environ.get("TRAVIS")
+        or os.environ.get("JENKINS_URL")
+        or os.environ.get("BUILDKITE")
+        or os.environ.get("TF_BUILD")  # Azure Pipelines
+    )
+    _is_container = (
+        Path("/.dockerenv").exists()
+        or bool(os.environ.get("KUBERNETES_SERVICE_HOST"))
+        or os.environ.get("container") == "docker"
+    )
+
+    # ── Step 2: Termux detection (only when not in CI/container) ─────────────
+    if _is_ci or _is_container:
+        is_termux = False
+    else:
+        is_termux = (
+            bool(os.environ.get("TERMUX_VERSION"))
+            or "com.termux" in os.environ.get("PREFIX", "")
+            or "/data/data/com.termux" in os.environ.get("HOME", "")
+            or Path("/data/data/com.termux").exists()
+        )
+
+    is_container = _is_container
     is_linux = uname.system == "Linux"
     is_arm = uname.machine in ("aarch64", "arm64", "armv7l", "armv7")
     is_x86 = uname.machine in ("x86_64", "amd64")
