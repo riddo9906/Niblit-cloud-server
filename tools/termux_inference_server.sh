@@ -60,6 +60,102 @@ GOVERNANCE_ENABLED=1
 DRY_RUN=0
 READINESS_TIMEOUT=60
 
+# ── Path resolution ────────────────────────────────────────────────────────────
+
+_find_model_in_dir() {
+  local dir="$1"
+  local pattern candidate candidate_name
+  local -a patterns=(
+    "*qwen*.gguf"
+    "*llama*.gguf"
+    "*mistral*.gguf"
+    "*mixtral*.gguf"
+    "*phi*.gguf"
+    "*gemma*.gguf"
+    "*deepseek*.gguf"
+    "*.gguf"
+  )
+  local -a candidates=()
+  [[ -d "$dir" ]] || return 1
+
+  mapfile -t candidates < <(find "$dir" -maxdepth 1 -type f -iname "*.gguf" | LC_ALL=C sort)
+
+  for pattern in "${patterns[@]}"; do
+    for candidate in "${candidates[@]}"; do
+      candidate_name="${candidate##*/}"
+      candidate_name="${candidate_name,,}"
+      if [[ "$candidate_name" == $pattern ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  done
+
+  return 1
+}
+
+_expand_path_tokens() {
+  local value="$1"
+  local home_dir="${HOME:-/data/data/com.termux/files/home}"
+  local termux_home="${TERMUX_HOME:-$home_dir}"
+
+  value="${value//\$\{TERMUX_HOME\}/$termux_home}"
+  value="${value//\$TERMUX_HOME/$termux_home}"
+  value="${value//\$\{HOME\}/$home_dir}"
+  value="${value//\$HOME/$home_dir}"
+
+  printf '%s\n' "$value"
+}
+
+_resolve_model_path() {
+  local original_model_path="${MODEL_PATH:-}"
+  local candidate_dir resolved=""
+
+  MODEL_PATH="$(_expand_path_tokens "$MODEL_PATH")"
+
+  if [[ -n "$MODEL_PATH" && -d "$MODEL_PATH" ]]; then
+    resolved="$(_find_model_in_dir "$MODEL_PATH")"
+  elif [[ -z "$MODEL_PATH" ]]; then
+    candidate_dir="${HOME:-/data/data/com.termux/files/home}/models"
+    resolved="$(_find_model_in_dir "$candidate_dir")"
+  fi
+
+  if [[ -n "$resolved" ]]; then
+    MODEL_PATH="$resolved"
+    if [[ "$MODEL_PATH" != "$original_model_path" ]]; then
+      echo "[niblit-termux] resolved model path: $MODEL_PATH" >&2
+    fi
+  fi
+}
+
+_resolve_backend_bin() {
+  local original_backend_bin="${BACKEND_BIN:-}"
+  local candidate resolved=""
+
+  BACKEND_BIN="$(_expand_path_tokens "$BACKEND_BIN")"
+
+  if [[ -n "$BACKEND_BIN" && "$BACKEND_BIN" == */* && -x "$BACKEND_BIN" ]]; then
+    return 0
+  fi
+
+  if command -v "$BACKEND_BIN" >/dev/null 2>&1; then
+    BACKEND_BIN="$(command -v "$BACKEND_BIN")"
+    return 0
+  fi
+
+  local default_candidate="${HOME:-/data/data/com.termux/files/home}/llama.cpp/build/bin/llama-server"
+  if [[ -x "$default_candidate" ]]; then
+    resolved="$default_candidate"
+  fi
+
+  if [[ -n "$resolved" ]]; then
+    BACKEND_BIN="$resolved"
+    if [[ "$BACKEND_BIN" != "$original_backend_bin" ]]; then
+      echo "[niblit-termux] resolved backend binary: $BACKEND_BIN" >&2
+    fi
+  fi
+}
+
 # ── Trap / cleanup ─────────────────────────────────────────────────────────────
 
 _cleanup() {
@@ -146,6 +242,9 @@ _load_profile() {
 # ── Validation ────────────────────────────────────────────────────────────────
 
 _validate() {
+  _resolve_model_path
+  _resolve_backend_bin
+
   if [[ -z "$MODEL_PATH" ]]; then
     echo "[niblit-termux] ERROR: model path not set. Use --model or NIBLIT_MODEL_PATH." >&2
     exit 1
@@ -154,7 +253,7 @@ _validate() {
     echo "[niblit-termux] ERROR: model file not found: $MODEL_PATH" >&2
     exit 1
   fi
-  if ! command -v "$BACKEND_BIN" >/dev/null 2>&1; then
+  if [[ ! -x "$BACKEND_BIN" ]] && ! command -v "$BACKEND_BIN" >/dev/null 2>&1; then
     echo "[niblit-termux] ERROR: backend binary '$BACKEND_BIN' not found in PATH." >&2
     echo "[niblit-termux] Hint: run tools/install_llama_server.sh or install llama.cpp" >&2
     exit 1
