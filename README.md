@@ -1,27 +1,53 @@
-# Niblit Cloud Server (GGUF + Hugging Face-style API)
+# Niblit Cognitive Cloud Runtime (Phase Ω.9)
 
-Standalone Python FastAPI server that serves local GGUF models through
-Hugging Face-compatible chat/inference endpoints so it can be used directly by
-Niblit provider logic and other compatible clients.
+A **governed, observable, adaptive multi-model inference runtime** — the distributed cognitive execution layer for the Niblit ecosystem.
+
+> **Backward compatible**: all existing HuggingFace-style, llama.cpp, and QwenLocalBrain-compatible APIs are fully preserved.
+
+## Runtime role in the ecosystem
+
+This repository is the canonical **runtime orchestration authority** in the Niblit ecosystem.
+It interoperates with:
+
+- `riddo9906/Niblit` (cognition + governance authority)
+- `riddo9906/niblit-lean-algos` (execution cognition authority)
+
+## What changed in Phase Ω.9
+
+The server is no longer just a GGUF inference endpoint.  It has evolved into:
+
+| Layer | Module | Purpose |
+|---|---|---|
+| **Model Orchestration** | `app/model_orchestrator.py` | Trust-scored, latency-aware multi-model routing |
+| **Cognitive Envelope** | `app/cognitive_envelope.py` | Schema-v2 request enrichment (backward compat) |
+| **Constitutional Governance** | `app/cloud_governance.py` | Seven constitutional laws + cloud safety guards |
+| **Temporal Coherence** | `app/temporal_sync.py` | Epoch tracking, coherence EMA, drift detection |
+| **Reflection Engine** | `app/reflection_engine.py` | Quality telemetry, JSONL persistence, auto-reflection |
+| **Attention Economy** | `app/attention_allocator.py` | Salience-weighted request prioritization |
+| **Trading Bridge** | `app/trading_runtime_bridge.py` | niblit-lean-algos signal/regime integration |
+| **Event Bus** | `app/event_bus.py` | Structured events aligned with Niblit Ω.7 constants |
+| **Node Identity** | `app/node_identity.py` | Stable fingerprint, cluster/swarm readiness stubs |
+| **Federation Stubs** | `app/federation.py` | Node registration/discovery/heartbeat/governance sync stubs |
 
 ## Features
 
 - Hugging Face-style chat completions endpoint (`/v1/chat/completions`)
 - Hugging Face-style inference endpoint (`/models/{model}`)
 - **Drop-in llama-server replacement** for Niblit's `QwenLocalBrain` HTTP backend
-  - Handles `"model": "local"` alias automatically (Niblit sends this by default)
-  - Responds to all probe endpoints Niblit uses: `GET /health`, `GET /v1/models`, `GET /props`
-  - Supports legacy `POST /completion` endpoint fallback path
-- Multiple compatibility routes for provider URL patterns:
-  - `/hf/...`
-  - `/local/...`
-  - `/kimi/...`
-  - `/claude/...`
-- Model discovery endpoints:
-  - `GET /v1/models`
-  - `GET /v1/models/{model}`
-- GGUF runtime via `llama-cpp-python`
-- Ready for Docker / Fly.io / Hugging Face Spaces deployment
+  - Handles `"model": "local"` alias automatically
+  - Responds to all probe endpoints: `GET /health`, `GET /v1/models`, `GET /props`
+  - Supports legacy `POST /completion` endpoint
+- Multi-model orchestration with trust + latency scoring
+- Optional cognitive envelope (schema v2) — plain requests still work
+- Constitutional governance (7 laws + cloud safety guards)
+- Temporal epoch synchronization
+- Cognitive telemetry via JSONL reflection logs
+- Attention economy (salience-based request prioritization)
+- Trading cognition bridge (reads niblit-lean-algos signal files)
+- Structured event bus aligned with Niblit Phase Ω.7
+- Node identity + cluster readiness stubs for future swarm cognition
+- Federation preparation endpoints and runtime federation manager stubs
+- Portable runtime operations toolkit in `tools/`
 
 ## Quick start
 
@@ -35,14 +61,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## Connecting Niblit to this server
 
-Set the following environment variables in your **Niblit** deployment
-(e.g. Fly.io secrets, Vercel env, or local `.env`):
+Set the following environment variables in your **Niblit** deployment:
 
 ```bash
-# Point QwenLocalBrain at the cloud server instead of localhost:8080
 NIBLIT_LLAMA_SERVER_URL=https://<your-cloud-server>.fly.dev
 NIBLIT_GGUF_BACKEND=http
-# Optional: increase timeout for cloud inference (default is 120 s)
 NIBLIT_LLAMA_SERVER_TIMEOUT=300
 ```
 
@@ -51,47 +74,157 @@ Niblit's `QwenLocalBrain` will then:
 2. Call `POST /v1/chat/completions` with `"model": "local"` → handled ✅
 3. Fall back to `POST /completion` if needed → handled ✅
 
-
 ## Configuration
 
-Environment variables:
+See `.env.example` for all options.
 
-- `GGUF_MODELS_JSON` — JSON map of `model_id -> gguf_path`
-  - Example:
-    `{"qwen2.5-0.5b":"./models/qwen2.5-0.5b-instruct-q4_k_m.gguf"}`
-- `DEFAULT_MODEL_ID` — model id used if request does not provide one
-- `COMPAT_PREFIXES` — comma-separated compatibility URL prefixes
-  (default: `hf,local,kimi,claude`)
-- `N_CTX` — context length for llama.cpp (default: `4096`)
-- `N_THREADS` — thread count for llama.cpp (default: `4`)
+### Core
 
-## API examples
+| Variable | Default | Description |
+|---|---|---|
+| `GGUF_MODELS_JSON` | `{}` | JSON map of `model_id → gguf_path` |
+| `DEFAULT_MODEL_ID` | first model | Default model if request omits model |
+| `COMPAT_PREFIXES` | `hf,local,kimi,claude` | Compatibility URL prefixes |
+| `N_CTX` | `4096` | llama.cpp context length |
+| `N_THREADS` | `4` | llama.cpp thread count |
 
-### Chat completions (HF-style)
+### Cognitive Runtime (Phase Ω.7)
 
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "content-type: application/json" \
-  -d '{
-    "model":"qwen2.5-0.5b",
-    "messages":[{"role":"user","content":"Hello from Niblit"}],
-    "temperature":0.2,
-    "max_tokens":128
-  }'
+| Variable | Default | Description |
+|---|---|---|
+| `NIBLIT_MO_ENABLED` | `1` | Enable model orchestrator |
+| `NIBLIT_CG_ENABLED` | `1` | Enable constitutional governance |
+| `NIBLIT_CG_STRICT` | `1` | Strict mode (blocks violations) |
+| `NIBLIT_CG_MAX_TOKENS` | `8192` | Hard token ceiling |
+| `NIBLIT_RE_ENABLED` | `1` | Enable reflection engine |
+| `NIBLIT_AA_ENABLED` | `1` | Enable attention economy |
+| `NIBLIT_TRADING_BRIDGE_ENABLED` | `1` | Enable trading bridge |
+
+## API
+
+### Existing endpoints (unchanged)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health`, `/healthz` | Health probe |
+| `GET` | `/props` | Legacy llama-server probe |
+| `GET` | `/v1/models` | List models |
+| `GET` | `/v1/models/{id}` | Get model info |
+| `POST` | `/v1/chat/completions` | Chat completions (OpenAI-style) |
+| `POST` | `/completion` | Legacy llama-server completion |
+| `POST` | `/models/{model}` | HuggingFace inference API |
+| `POST` | `/{prefix}/...` | Compatibility prefix routes |
+
+### New cognitive endpoints (Phase Ω.9)
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/cognitive/chat` | Enriched chat with cognitive metadata |
+| `GET` | `/v1/runtime/status` | Full runtime snapshot |
+| `GET` | `/v1/runtime/coherence` | Temporal coherence state |
+| `GET` | `/v1/runtime/governance` | Constitutional governance stats |
+| `GET` | `/v1/runtime/attention` | Attention economy metrics |
+| `GET` | `/v1/runtime/models` | Model orchestration health |
+| `GET` | `/v1/runtime/reflection` | Reflection engine telemetry |
+| `GET` | `/v1/runtime/trading` | Trading cognition bridge state |
+| `GET` | `/v1/runtime/epoch` | Current epoch and coherence |
+| `GET` | `/v1/runtime/mode` | Runtime mode + resource adaptation posture |
+| `GET` | `/v1/runtime/node` | Node identity + federation posture |
+| `GET` | `/v1/runtime/topology` | Topology/profile/federation compatibility summary |
+| `GET` | `/v1/runtime/diagnostics` | Runtime health/pressure/coherence/governance diagnostics |
+| `GET` | `/metrics/cognitive` | Cognitive telemetry metrics |
+| `GET` | `/metrics/coherence` | Coherence metrics |
+| `GET` | `/metrics/governance` | Governance metrics |
+| `GET` | `/metrics/models` | Model health metrics |
+| `GET` | `/cluster/status` | Cluster status (single-node) |
+| `GET` | `/cluster/identity` | Node identity |
+| `GET` | `/cluster/capabilities` | Node capabilities |
+| `GET` | `/federation/status` | Federation manager status (stub) |
+| `GET` | `/federation/peers` | Known peers (stub) |
+| `POST` | `/federation/register` | Node registration stub |
+| `POST` | `/federation/discover` | Cluster discovery stub |
+| `POST` | `/federation/heartbeat` | Runtime heartbeat stub |
+| `POST` | `/federation/governance/sync` | Governance synchronization stub |
+| `POST` | `/federation/epoch/sync` | Temporal epoch synchronization stub |
+
+### Cognitive Envelope (optional)
+
+Any chat request can optionally include cognitive envelope fields.  Plain
+requests that omit these fields are fully backward compatible:
+
+```json
+{
+  "model": "qwen2.5-0.5b",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "intent": "analytical",
+  "execution_mode": "balanced",
+  "coherence_score": 0.91,
+  "constitutional_priority": "safety",
+  "attention_budget": 0.8,
+  "resource_mode": "balanced",
+  "epoch_tag": "epoch_4421",
+  "governance": {"governance_mode": "normal"},
+  "temporal": {"coherence_score": 0.91}
+}
 ```
 
-### Inference API format
+## Architecture
+
+See [architecture.md](architecture.md) for a full system diagram and layer descriptions.
+
+## Deployment
+
+See [deployment.md](deployment.md) for Docker, Fly.io, and HuggingFace Spaces instructions.
+
+## Runtime Operations Toolkit
+
+The repository now includes portable runtime tooling under `tools/`:
+
+- `tools/cloud_runtime_ctl.py` — governance-aware runtime control CLI (HTTP / UNIX socket / TCP admin transport)
+- `tools/niblit_ctl.py` — thin sidecar/runtime wrapper CLI (health/status/federation/topology/compatibility)
+- `tools/lib/runtime_client.py` — reusable runtime client library for automation
+- `tools/lib/sidecar_client.py` — sidecar client with transport fallback + lineage/replay metadata
+- `tools/install_runtime.sh` — portable backend installer (Fly.io, Docker, VPS, ARM, edge devices) with version pinning and checksum verification hooks
+- `tools/start_server.sh` — server start/stop/status/restart/smoke utility for operations runbooks
+
+These tools are designed for cloud/server operation and preserve compatibility with existing API routes.
+
+## Runtime profiles
+
+Profiles are stored in `tools/runtime_profiles/` and loaded with:
 
 ```bash
-curl -X POST http://localhost:8000/models/qwen2.5-0.5b \
-  -H "content-type: application/json" \
-  -d '{"inputs":"Hello from Niblit"}'
+source tools/runtime_profiles/profile_loader.sh cloud-server
+source tools/runtime_profiles/profile_loader.sh edge-runtime
 ```
+
+Supported profiles:
+- `niblit`
+- `cloud-server`
+- `termux-local`
+- `local-runtime`
+- `edge-runtime`
+- `degraded-runtime`
+- `disconnected-runtime`
+
+## Federation Roadmap (Preparation Phase)
+
+Current implementation is intentionally stubbed (no full federation yet):
+
+- ✅ Node registration interface
+- ✅ Cluster discovery interface
+- ✅ Capability advertisement
+- ✅ Runtime heartbeat interface
+- ✅ Governance sync interface
+- ✅ Temporal epoch sync interface
+- ⬜ Full peer networking protocol
+- ⬜ Consensus + trust-weighted governance replication
+- ⬜ Multi-node model orchestration
+
+This enables edge/phone/cloud hybrid topology planning without breaking existing deployments.
 
 ## Compatibility notes
 
-- The server exposes several endpoint aliases so clients configured for
-  `hf`, `local`, `kimi`, or `claude` provider-style base URLs can call the same
-  backend without custom rewrite logic.
-- If you need extra vendor mapping, set `COMPAT_PREFIXES` and keep your client
-  pointed at the same deployment base URL.
+- All existing provider routes (`hf`, `local`, `kimi`, `claude`) continue to work.
+- The `model: "local"` alias from Niblit's `QwenLocalBrain` is still handled.
+- Constitutional governance is **strict by default** — set `NIBLIT_CG_STRICT=0` for permissive (log-only) mode during migration.
