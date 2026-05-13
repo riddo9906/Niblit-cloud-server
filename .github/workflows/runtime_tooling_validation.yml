@@ -84,7 +84,7 @@ jobs:
           python tools/cloud_runtime_ctl.py --help >/dev/null
 
       - name: Validate local runtime validator
-        run: python -m pytest tests/test_runtime_tooling_layer.py -q --tb=short -k "runtime_validator"
+        run: python -m pytest tests/test_runtime_tooling_layer.py -q --tb=short -k "RuntimeValidator"
 
       - name: Validate backward compatibility
         run: python -m pytest tests/test_api.py -q --tb=short
