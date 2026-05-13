@@ -79,16 +79,11 @@ def detect_platform() -> dict[str, Any]:
     uname = platform.uname()
 
     # ── Step 1: CI / container detection (highest priority) ──────────────────
-    _is_ci = any([
-        os.environ.get("CI"),
-        os.environ.get("GITHUB_ACTIONS"),
-        os.environ.get("GITLAB_CI"),
-        os.environ.get("CIRCLECI"),
-        os.environ.get("TRAVIS"),
-        os.environ.get("JENKINS_URL"),
-        os.environ.get("BUILDKITE"),
-        os.environ.get("TF_BUILD"),  # Azure Pipelines
-    ])
+    _ci_env_vars = (
+        "CI", "GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI",
+        "TRAVIS", "JENKINS_URL", "BUILDKITE", "TF_BUILD",
+    )
+    _is_ci = any(os.environ.get(var) for var in _ci_env_vars)
     _is_container = (
         Path("/.dockerenv").exists()
         or bool(os.environ.get("KUBERNETES_SERVICE_HOST"))
