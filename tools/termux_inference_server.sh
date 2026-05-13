@@ -64,7 +64,7 @@ READINESS_TIMEOUT=60
 
 _find_model_in_dir() {
   local dir="$1"
-  local pattern candidate
+  local pattern candidate candidate_name
   local -a patterns=(
     "*qwen*.gguf"
     "*llama*.gguf"
@@ -82,7 +82,9 @@ _find_model_in_dir() {
 
   for pattern in "${patterns[@]}"; do
     for candidate in "${candidates[@]}"; do
-      if [[ "${candidate##*/,,}" == $pattern ]]; then
+      candidate_name="${candidate##*/}"
+      candidate_name="${candidate_name,,}"
+      if [[ "$candidate_name" == $pattern ]]; then
         printf '%s\n' "$candidate"
         return 0
       fi
