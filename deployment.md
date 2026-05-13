@@ -76,6 +76,17 @@ python tools/cloud_runtime_ctl.py --url http://127.0.0.1:8000 status
 python tools/cloud_runtime_ctl.py --url http://127.0.0.1:8000 diagnostics
 python tools/cloud_runtime_ctl.py --socket /tmp/niblit-runtime.sock health
 python tools/cloud_runtime_ctl.py --tcp-host 127.0.0.1 --tcp-port 9009 cluster
+python tools/niblit_ctl.py --url http://127.0.0.1:8000 topology
+python tools/niblit_ctl.py --url http://127.0.0.1:8000 compatibility
+```
+
+Runtime profiles:
+
+```bash
+source tools/runtime_profiles/profile_loader.sh cloud-server
+source tools/runtime_profiles/profile_loader.sh edge-runtime
+source tools/runtime_profiles/profile_loader.sh degraded-runtime
+source tools/runtime_profiles/profile_loader.sh disconnected-runtime
 ```
 
 ## HuggingFace Spaces
@@ -210,5 +221,4 @@ Recommended future topology (supported operationally by current tooling):
 python -m pytest -q
 ```
 
-All 92 tests should pass.  Original 13 backward-compatibility tests are
-preserved unchanged.
+All 155 tests should pass. Original backward-compatibility tests are preserved.

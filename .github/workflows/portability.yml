@@ -83,6 +83,17 @@ jobs:
           print(f"termux-local profile portability OK (n_ctx={n_ctx}, socket={env['NIBLIT_UNIX_SOCKET']})")
           EOF
 
+      - name: Validate degraded/disconnected profile mode contract
+        run: |
+          python - <<'EOF'
+          from tools.lib.runtime_profiles import profile_summary
+          degraded = profile_summary("degraded-runtime")
+          disconnected = profile_summary("disconnected-runtime")
+          assert degraded["runtime_mode"] == "survival", degraded
+          assert disconnected["runtime_mode"] == "lockdown", disconnected
+          print("Degraded/disconnected runtime mode contract OK")
+          EOF
+
       - name: Validate install_local_runtime.py is importable on all paths
         run: |
           python -c "

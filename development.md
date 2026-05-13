@@ -13,7 +13,7 @@ pip install -r requirements.txt
 
 ```bash
 python -m pytest -q
-# 148 tests expected to pass
+# 155 tests expected to pass
 ```
 
 ### Start the server locally
@@ -40,6 +40,10 @@ Runtime profiles centralize deployment configuration and prevent environment dri
 | `cloud-server` | Cloud server (Fly.io, Docker, VPS) | balanced |
 | `niblit` | Niblit main-app runtime | balanced |
 | `termux-local` | Termux / ARM edge device | minimal |
+| `local-runtime` | Portable local runtime topology | balanced |
+| `edge-runtime` | Portable edge runtime topology | minimal |
+| `degraded-runtime` | Degraded/high-pressure runtime | degraded |
+| `disconnected-runtime` | Offline/disconnected deterministic runtime | isolated |
 
 ### Using profiles (shell)
 
@@ -78,6 +82,10 @@ Profiles are `.env` files in `tools/runtime_profiles/`:
 - `niblit.env` — Niblit main-app runtime
 - `cloud-server.env` — Cloud server defaults
 - `termux-local.env` — Edge / Termux runtime
+- `local-runtime.env` — Portable local runtime
+- `edge-runtime.env` — Portable edge runtime
+- `degraded-runtime.env` — Survival-mode degraded runtime
+- `disconnected-runtime.env` — Lockdown-mode disconnected runtime
 
 Each profile defines: server address, socket paths, model paths, governance defaults,
 tunnel provider, federation stubs, and reflection telemetry paths.
@@ -87,6 +95,7 @@ tunnel provider, federation stubs, and reflection telemetry paths.
 ## Runtime Control CLI
 
 `tools/cloud_runtime_ctl.py` — governance-aware CLI for operating a running server.
+`tools/niblit_ctl.py` — thin wrapper on sidecar client for transport-normalized control.
 
 ```bash
 # Basic commands
@@ -113,6 +122,10 @@ python tools/cloud_runtime_ctl.py --tcp-host 127.0.0.1 --tcp-port 9009 health
 
 # Raw JSON output for piping
 python tools/cloud_runtime_ctl.py --url http://localhost:8000 --json diagnostics
+
+# sidecar wrapper
+python tools/niblit_ctl.py --url http://localhost:8000 status
+python tools/niblit_ctl.py --socket /tmp/niblit-cloud-server.sock federation
 ```
 
 ---
@@ -331,7 +344,7 @@ python -m pytest -q
 # Specific suites
 python -m pytest tests/test_api.py -q           # Backward compat (13 tests)
 python -m pytest tests/test_cognitive_runtime.py -q  # Cognitive runtime (92 tests)
-python -m pytest tests/test_runtime_tooling_layer.py -q  # Tooling layer (56 tests)
+python -m pytest tests/test_runtime_tooling_layer.py -q  # Tooling layer (63 tests)
 
 # Targeted
 python -m pytest tests/test_runtime_tooling_layer.py -k "profile" -q
@@ -397,7 +410,7 @@ Schema-v2 signal fields: `signal`, `confidence`, `regime`, `coherence_score`,
 
 ## Contributing
 
-1. Run `python -m pytest -q` before committing — all 148 tests must pass
+1. Run `python -m pytest -q` before committing — all 155 tests must pass
 2. New tooling must target at minimum: `local-linux`, `termux-local`, `cloud-server` profiles
 3. Governance mode names must match `GOVERNANCE_MODES` in `tools/lib/sidecar_client.py`
 4. Schema-v2 envelope field additions must be normalized in `normalize_envelope()`

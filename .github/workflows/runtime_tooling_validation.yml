@@ -78,6 +78,11 @@ jobs:
       - name: Validate sidecar client
         run: python -m pytest tests/test_runtime_tooling_layer.py -q --tb=short -k "sidecar"
 
+      - name: Validate niblit_ctl CLI wrapper
+        run: |
+          python tools/niblit_ctl.py --help >/dev/null
+          python tools/cloud_runtime_ctl.py --help >/dev/null
+
       - name: Validate local runtime validator
         run: python -m pytest tests/test_runtime_tooling_layer.py -q --tb=short -k "runtime_validator"
 

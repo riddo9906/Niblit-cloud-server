@@ -51,13 +51,13 @@ jobs:
         run: |
           python - <<'EOF'
           # Validate that governance modes used in tooling match Ω.7 constants
-          EXPECTED_MODES = {"normal", "cautious", "survival", "lockdown", "minimal"}
-          from tools.lib.sidecar_client import GOVERNANCE_MODES
-          drift = EXPECTED_MODES.symmetric_difference(GOVERNANCE_MODES)
+          EXPECTED_MODES = {"normal", "cautious", "survival", "lockdown"}
+          from tools.lib.sidecar_client import CANONICAL_RUNTIME_MODES
+          drift = EXPECTED_MODES.symmetric_difference(CANONICAL_RUNTIME_MODES)
           if drift:
               print(f"GOVERNANCE_MODE DRIFT DETECTED: {drift}")
               raise SystemExit(1)
-          print(f"Governance modes aligned: {sorted(GOVERNANCE_MODES)}")
+          print(f"Governance modes aligned: {sorted(CANONICAL_RUNTIME_MODES)}")
           EOF
 
       - name: Check event bus constants exist

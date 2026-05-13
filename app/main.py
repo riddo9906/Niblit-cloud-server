@@ -31,6 +31,16 @@ _LOCAL_MODEL_ALIASES: frozenset[str] = frozenset({"local", "llama", "default"})
 # Shared defaults for request schemas.
 _DEFAULT_TEMPERATURE: float = 0.2
 _DEFAULT_MAX_TOKENS: int = 256
+_CANONICAL_MODES: tuple[str, ...] = ("normal", "cautious", "survival", "lockdown")
+
+
+def _normalize_runtime_mode(mode: object, default: str = "normal") -> str:
+    candidate = str(mode or default).strip().lower()
+    if candidate in ("minimal", "constrained"):
+        candidate = "cautious"
+    if candidate not in _CANONICAL_MODES:
+        return default
+    return candidate
 
 
 def _load_models_from_env() -> dict[str, str]:
@@ -602,8 +612,8 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         manager: ModelManager = app.state.model_manager
         status: dict[str, Any] = {
             "runtime": "niblit_cognitive_cloud_runtime",
-            "version": "0.7.0",
-            "phase": "omega.7",
+            "version": "0.9.0",
+            "phase": "omega.9",
             "models": manager.list_models(),
             "default_model": manager.get_default_model_info(),
         }
@@ -716,27 +726,42 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     @app.get("/v1/runtime/mode")
     def runtime_mode() -> dict[str, Any]:
         """Current runtime/governance mode and adaptation posture."""
-        mode = "normal"
+        mode = _normalize_runtime_mode(os.getenv("NIBLIT_RUNTIME_MODE", "normal"))
         strict = None
+        reasons: list[str] = []
         if _governance_mod:
             try:
                 g = _governance_mod.get_cloud_governance().status()
                 strict = g.get("strict_mode")
                 if g.get("block_rate", 0.0) > 0.2:
                     mode = "cautious"
+                    reasons.append("governance_block_rate")
             except Exception:
                 pass
         if _attention_mod:
             try:
                 if _attention_mod.get_attention_allocator().status().get("overload"):
                     mode = "survival"
+                    reasons.append("attention_overload")
             except Exception:
                 pass
+        if _federation_mod:
+            try:
+                fed = _federation_mod.get_federation_manager().status()
+                connectivity = ((fed.get("topology") or {}).get("connectivity") or "").lower()
+                if connectivity in {"offline", "disconnected"}:
+                    mode = "lockdown"
+                    reasons.append("federation_disconnected")
+            except Exception:
+                pass
+        mode = _normalize_runtime_mode(mode)
         return {
             "mode": mode,
+            "governance_mode": mode,
             "strict_governance": strict,
-            "phase": "omega.7",
+            "phase": "omega.9",
             "resource_adaptation": "attention_economy",
+            "reasons": reasons,
         }
 
     @app.get("/v1/runtime/node")
@@ -754,6 +779,40 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             except Exception:
                 pass
         return node
+
+    @app.get("/v1/runtime/topology")
+    def runtime_topology() -> dict[str, Any]:
+        """Topology-aware runtime coordination summary."""
+        profile = os.getenv("NIBLIT_PROFILE", "cloud-server")
+        mode = runtime_mode().get("mode", "normal")
+        topology: dict[str, Any] = {
+            "profile": profile,
+            "runtime_mode": _normalize_runtime_mode(mode),
+            "governance_mode": _normalize_runtime_mode(mode),
+            "compatibility": {
+                "schema_version": "2.x",
+                "event_contract_version": "omega-7",
+                "governance_contract_version": "1.x",
+                "advisor_protocol_version": "2.x",
+                "runtime_mode_contract": "2026.05",
+            },
+        }
+        if _identity_mod:
+            try:
+                snap = _identity_mod.get_node_identity().snapshot()
+                topology["node"] = snap.to_dict()
+            except Exception:
+                pass
+        if _federation_mod:
+            try:
+                fed = _federation_mod.get_federation_manager().status()
+                topology["federation"] = fed
+                topology["connectivity"] = ((fed.get("topology") or {}).get("connectivity") or "standalone")
+            except Exception:
+                topology["connectivity"] = "unknown"
+        else:
+            topology["connectivity"] = "unknown"
+        return topology
 
     @app.get("/v1/runtime/diagnostics")
     def runtime_diagnostics() -> dict[str, Any]:
@@ -773,6 +832,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             "reflection_statistics": {},
             "coherence_drift": {},
             "federation": {"status": "standalone"},
+            "topology": {},
         }
 
         try:
@@ -848,6 +908,10 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 diagnostics["federation"] = _federation_mod.get_federation_manager().status()
             except Exception:
                 pass
+        try:
+            diagnostics["topology"] = runtime_topology()
+        except Exception:
+            pass
 
         return diagnostics
 

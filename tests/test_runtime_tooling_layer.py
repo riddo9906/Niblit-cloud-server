@@ -50,7 +50,7 @@ class TestRuntimeProfiles:
 
         env = get_profile_env("termux-local")
         assert env["NIBLIT_PROFILE"] == "termux-local"
-        assert env["NIBLIT_RUNTIME_MODE"] == "minimal"
+        assert env["NIBLIT_RUNTIME_MODE"] == "cautious"
         n_ctx = int(env["NIBLIT_N_CTX"])
         assert n_ctx <= 4096, f"termux n_ctx too large: {n_ctx}"
 
@@ -89,7 +89,7 @@ class TestRuntimeProfiles:
         for profile in KNOWN_PROFILES:
             summary = profile_summary(profile)
             assert "error" not in summary, f"Profile '{profile}' has error"
-            assert summary["runtime_mode"] in ("normal", "minimal", "balanced"), \
+            assert summary["runtime_mode"] in ("normal", "cautious", "survival", "lockdown"), \
                 f"Profile '{profile}' has unexpected runtime_mode: {summary['runtime_mode']}"
             assert isinstance(summary["governance_strict"], bool)
 
@@ -104,6 +104,36 @@ class TestRuntimeProfiles:
 
         summary = profile_summary("termux-local")
         assert summary["resource_class"] == "minimal"
+
+    def test_degraded_and_disconnected_profiles(self):
+        from tools.lib.runtime_profiles import profile_summary
+
+        degraded = profile_summary("degraded-runtime")
+        disconnected = profile_summary("disconnected-runtime")
+        assert degraded["runtime_mode"] == "survival"
+        assert disconnected["runtime_mode"] == "lockdown"
+
+    def test_mode_normalization_aliases(self):
+        from tools.lib.runtime_profiles import normalize_runtime_mode
+
+        assert normalize_runtime_mode("minimal") == "cautious"
+        assert normalize_runtime_mode("constrained") == "cautious"
+        assert normalize_runtime_mode("lockdown") == "lockdown"
+
+    def test_profile_resolver(self):
+        from tools.lib.runtime_profiles import resolve_profile
+
+        assert resolve_profile(topology="edge") == "edge-runtime"
+        assert resolve_profile(topology="local") == "local-runtime"
+        assert resolve_profile(degraded=True) == "degraded-runtime"
+        assert resolve_profile(disconnected=True) == "disconnected-runtime"
+
+    def test_profile_summary_includes_compatibility(self):
+        from tools.lib.runtime_profiles import profile_summary
+
+        summary = profile_summary("cloud-server")
+        assert "compatibility" in summary
+        assert summary["compatibility"]["schema_version"] == "2.x"
 
     def test_brace_expansion_in_profile_values(self):
         """Profile values like ${HOME}/models should expand."""
@@ -137,6 +167,7 @@ class TestRuntimeProfiles:
 class TestSidecarClient:
     def test_protocol_constants(self):
         from tools.lib.sidecar_client import (
+            CANONICAL_RUNTIME_MODES,
             DEFAULT_TIMEOUT,
             GOVERNANCE_MODES,
             INTENT_TYPES,
@@ -146,16 +177,17 @@ class TestSidecarClient:
         assert SIDECAR_PROTOCOL_VERSION.startswith("sidecar/")
         assert DEFAULT_TIMEOUT > 0
         assert "normal" in GOVERNANCE_MODES
+        assert "lockdown" in CANONICAL_RUNTIME_MODES
         assert "trading" in INTENT_TYPES
         assert "conversational" in INTENT_TYPES
 
     def test_governance_modes_alignment(self):
         """Governance modes must match Ω.7 constants."""
-        from tools.lib.sidecar_client import GOVERNANCE_MODES
+        from tools.lib.sidecar_client import CANONICAL_RUNTIME_MODES
 
-        expected = {"normal", "cautious", "survival", "lockdown", "minimal"}
-        assert expected.issubset(GOVERNANCE_MODES), \
-            f"Missing Ω.7 governance modes: {expected - GOVERNANCE_MODES}"
+        expected = {"normal", "cautious", "survival", "lockdown"}
+        assert expected == set(CANONICAL_RUNTIME_MODES), \
+            f"Canonical mode drift: expected={expected} got={set(CANONICAL_RUNTIME_MODES)}"
 
     def test_normalize_envelope_identity(self):
         from tools.lib.sidecar_client import normalize_envelope
@@ -210,6 +242,16 @@ class TestSidecarClient:
 
         client = SidecarClient(SidecarClientConfig(http_base_url="http://localhost:9999"))
         assert client._cfg.http_base_url == "http://localhost:9999"
+
+    def test_sidecar_compatibility_checker(self):
+        from tools.lib.sidecar_client import check_compatibility
+
+        ok = check_compatibility({"compatibility": {"schema_version": "2.x"}})
+        assert ok["compatible"]
+
+        bad = check_compatibility({"compatibility": {"schema_version": "1.x"}})
+        assert not bad["compatible"]
+        assert "schema_version" in bad["mismatches"]
 
     def test_sidecar_response_repr(self):
         from tools.lib.sidecar_client import SidecarResponse
@@ -466,12 +508,25 @@ class TestBackwardCompatibility:
         data = resp.json()
         assert "runtime_health" in data
 
+    def test_runtime_topology_endpoint_works(self):
+        client, _ = self._make_client()
+        resp = client.get("/v1/runtime/topology")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "compatibility" in data
+        assert "runtime_mode" in data
+
     def test_runtime_client_and_sidecar_client_are_independent(self):
         """RuntimeClient and SidecarClient must be importable independently."""
         from tools.lib import runtime_client, sidecar_client
 
         assert hasattr(runtime_client, "RuntimeClient")
         assert hasattr(sidecar_client, "SidecarClient")
+
+    def test_niblit_ctl_wrapper_importable(self):
+        from tools import niblit_ctl
+
+        assert callable(niblit_ctl.main)
 
     def test_runtime_profiles_do_not_modify_env_on_import(self):
         """Importing runtime_profiles must not side-effect os.environ."""

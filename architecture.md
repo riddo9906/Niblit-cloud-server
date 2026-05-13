@@ -1,9 +1,14 @@
-# Niblit Cognitive Cloud Runtime — Architecture (Phase Ω.7)
+# Niblit Cognitive Cloud Runtime — Architecture (Phase Ω.9)
 
 ## Overview
 
 The Niblit Cognitive Cloud Runtime transforms a simple GGUF inference endpoint
-into a **governed, observable, adaptive multi-model cognitive execution node**.
+into a **governed, observable, topology-aware runtime orchestration node**.
+
+Authority boundaries:
+- `riddo9906/Niblit`: governance/cognition authority
+- `riddo9906/Niblit-cloud-server`: runtime orchestration authority
+- `riddo9906/niblit-lean-algos`: execution cognition authority
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐

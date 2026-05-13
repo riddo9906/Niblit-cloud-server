@@ -1,10 +1,18 @@
-# Niblit Cognitive Cloud Runtime (Phase Ω.7)
+# Niblit Cognitive Cloud Runtime (Phase Ω.9)
 
 A **governed, observable, adaptive multi-model inference runtime** — the distributed cognitive execution layer for the Niblit ecosystem.
 
 > **Backward compatible**: all existing HuggingFace-style, llama.cpp, and QwenLocalBrain-compatible APIs are fully preserved.
 
-## What changed in Phase Ω.7
+## Runtime role in the ecosystem
+
+This repository is the canonical **runtime orchestration authority** in the Niblit ecosystem.
+It interoperates with:
+
+- `riddo9906/Niblit` (cognition + governance authority)
+- `riddo9906/niblit-lean-algos` (execution cognition authority)
+
+## What changed in Phase Ω.9
 
 The server is no longer just a GGUF inference endpoint.  It has evolved into:
 
@@ -107,7 +115,7 @@ See `.env.example` for all options.
 | `POST` | `/models/{model}` | HuggingFace inference API |
 | `POST` | `/{prefix}/...` | Compatibility prefix routes |
 
-### New cognitive endpoints (Phase Ω.7)
+### New cognitive endpoints (Phase Ω.9)
 
 | Method | Path | Description |
 |---|---|---|
@@ -122,6 +130,7 @@ See `.env.example` for all options.
 | `GET` | `/v1/runtime/epoch` | Current epoch and coherence |
 | `GET` | `/v1/runtime/mode` | Runtime mode + resource adaptation posture |
 | `GET` | `/v1/runtime/node` | Node identity + federation posture |
+| `GET` | `/v1/runtime/topology` | Topology/profile/federation compatibility summary |
 | `GET` | `/v1/runtime/diagnostics` | Runtime health/pressure/coherence/governance diagnostics |
 | `GET` | `/metrics/cognitive` | Cognitive telemetry metrics |
 | `GET` | `/metrics/coherence` | Coherence metrics |
@@ -172,11 +181,31 @@ See [deployment.md](deployment.md) for Docker, Fly.io, and HuggingFace Spaces in
 The repository now includes portable runtime tooling under `tools/`:
 
 - `tools/cloud_runtime_ctl.py` — governance-aware runtime control CLI (HTTP / UNIX socket / TCP admin transport)
+- `tools/niblit_ctl.py` — thin sidecar/runtime wrapper CLI (health/status/federation/topology/compatibility)
 - `tools/lib/runtime_client.py` — reusable runtime client library for automation
+- `tools/lib/sidecar_client.py` — sidecar client with transport fallback + lineage/replay metadata
 - `tools/install_runtime.sh` — portable backend installer (Fly.io, Docker, VPS, ARM, edge devices) with version pinning and checksum verification hooks
 - `tools/start_server.sh` — server start/stop/status/restart/smoke utility for operations runbooks
 
 These tools are designed for cloud/server operation and preserve compatibility with existing API routes.
+
+## Runtime profiles
+
+Profiles are stored in `tools/runtime_profiles/` and loaded with:
+
+```bash
+source tools/runtime_profiles/profile_loader.sh cloud-server
+source tools/runtime_profiles/profile_loader.sh edge-runtime
+```
+
+Supported profiles:
+- `niblit`
+- `cloud-server`
+- `termux-local`
+- `local-runtime`
+- `edge-runtime`
+- `degraded-runtime`
+- `disconnected-runtime`
 
 ## Federation Roadmap (Preparation Phase)
 
