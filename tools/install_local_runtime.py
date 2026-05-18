@@ -225,7 +225,7 @@ def find_models_in_dir(model_dir: str | None = None) -> list[str]:
     search_dirs += [
         Path.home() / "models",
         Path.home() / ".niblit" / "models",
-        Path("/data/data/com.termux/files/home/models"),  # Termux
+        Path("/home/riddo9906/models"),
         Path("/opt/models"),
     ]
 

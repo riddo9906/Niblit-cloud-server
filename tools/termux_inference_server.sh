@@ -96,7 +96,7 @@ _find_model_in_dir() {
 
 _expand_path_tokens() {
   local value="$1"
-  local home_dir="${HOME:-/data/data/com.termux/files/home}"
+  local home_dir="${HOME:-/home/riddo9906}"
   local termux_home="${TERMUX_HOME:-$home_dir}"
 
   value="${value//\$\{TERMUX_HOME\}/$termux_home}"
@@ -116,7 +116,7 @@ _resolve_model_path() {
   if [[ -n "$MODEL_PATH" && -d "$MODEL_PATH" ]]; then
     resolved="$(_find_model_in_dir "$MODEL_PATH")"
   elif [[ -z "$MODEL_PATH" ]]; then
-    candidate_dir="${HOME:-/data/data/com.termux/files/home}/models"
+    candidate_dir="${HOME:-/home/riddo9906}/models"
     resolved="$(_find_model_in_dir "$candidate_dir")"
   fi
 
@@ -143,7 +143,7 @@ _resolve_backend_bin() {
     return 0
   fi
 
-  local default_candidate="${HOME:-/data/data/com.termux/files/home}/llama.cpp/build/bin/llama-server"
+  local default_candidate="${HOME:-/home/riddo9906}/llama.cpp/build/bin/llama-server"
   if [[ -x "$default_candidate" ]]; then
     resolved="$default_candidate"
   fi
