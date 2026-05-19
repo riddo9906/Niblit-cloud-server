@@ -237,6 +237,10 @@ class TwoModelManager(ModelManager):
 
 
 def make_two_model_client() -> tuple[TestClient, TwoModelManager]:
+    # Reset the orchestrator singleton so each test gets a clean health slate.
+    import app.model_orchestrator as _orch_mod
+    _orch_mod._orch = None
+
     manager = TwoModelManager()
     app = create_app(model_manager=manager)
     return TestClient(app), manager
@@ -290,7 +294,7 @@ def test_switch_model_alias_local_follows_active_model():
 
 def test_switch_model_back_to_llama3():
     """Can switch back from qwen to llama3."""
-    client, _ = make_two_model_client()
+    client, manager = make_two_model_client()
 
     client.post("/v1/runtime/model/switch", json={"model_id": "qwen"})
     resp = client.post("/v1/runtime/model/switch", json={"model_id": "llama3"})
@@ -302,6 +306,15 @@ def test_switch_model_back_to_llama3():
 
     # Active model endpoint must reflect the last switch
     assert client.get("/v1/runtime/model/active").json()["active_model"] == "llama3"
+
+    # 'local' alias should now route to llama3 (fresh orchestrator, equal scores,
+    # tiebreaker favours the active/default model)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "local", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert manager.last_chat_call["model_id"] == "llama3"
 
 
 def test_switch_model_unknown_returns_404():

@@ -145,9 +145,9 @@ class ModelManager:
         Returns the previous active model ID.  Raises HTTPException 404 if
         *model_id* is not registered.
         """
-        if model_id not in self._model_map:
-            raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
         with self._lock:
+            if model_id not in self._model_map:
+                raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
             previous = self._default_model
             self._default_model = model_id
         logger.info("Active model switched: %s -> %s", previous, model_id)
@@ -735,8 +735,8 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         if _orchestrator_mod:
             try:
                 _orchestrator_mod.get_model_orchestrator().register_model(payload.model_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("switch_model: orchestrator registration failed: %s", exc)
         logger.info("Model switch requested: %s -> %s", previous, payload.model_id)
         return {
             "status": "switched",
