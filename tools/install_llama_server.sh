@@ -225,5 +225,5 @@ cat <<MSG
 [install-llama]
 [install-llama] To launch Niblit Termux runtime:
 [install-llama]   NIBLIT_MODEL_PATH=/path/to/model.gguf \\
-[install-llama]     tools/termux_inference_server.sh --profile termux-local
+[install-llama]     tools/qwen_server.sh --profile termux-local
 MSG

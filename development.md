@@ -196,22 +196,22 @@ Canonical governance modes: `normal`, `cautious`, `survival`, `lockdown`, `minim
 # 1. Install llama.cpp backend
 ./tools/install_llama_server.sh --backend llama-server
 
-# 2. Launch inference server
+# 2. Launch inference server (Qwen model)
 # termux-local auto-resolves ~/models/*.gguf and ~/llama.cpp/build/bin/llama-server
-./tools/termux_inference_server.sh --profile termux-local
+./tools/qwen_server.sh --profile termux-local
 
-# 3. With cloudflared tunnel
-./tools/termux_inference_server.sh \
+# 3. With cloudflared tunnel (Qwen)
+./tools/qwen_server.sh \
   --model ~/models/qwen2.5-1.5b.gguf \
   --profile termux-local \
   --tunnel cloudflared
 
 # 4. With manual public URL (e.g. from existing tunnel)
 NIBLIT_TUNNEL_PUBLIC_URL=https://my-tunnel.example.com \
-  ./tools/termux_inference_server.sh --model ~/models/model.gguf
+  ./tools/qwen_server.sh --model ~/models/model.gguf
 
 # 5. Dry run (validate config without starting)
-./tools/termux_inference_server.sh --model ~/models/model.gguf --dry-run
+./tools/qwen_server.sh --model ~/models/model.gguf --dry-run
 ```
 
 ### Termux runtime launcher options
@@ -327,7 +327,8 @@ LLAMA_SERVER_SHA256="abc123..." \
 | `tools/lib/runtime_profiles.py` | Runtime profile loader (Python API) |
 | `tools/runtime_profiles/*.env` | Profile definitions |
 | `tools/runtime_profiles/profile_loader.sh` | Shell profile loader |
-| `tools/termux_inference_server.sh` | Termux/ARM inference server launcher |
+| `tools/qwen_server.sh` | Qwen model inference server launcher |
+| `tools/llama_server.sh` | Llama3 model inference server launcher |
 | `tools/install_llama_server.sh` | Portable llama.cpp installer |
 | `tools/install_local_runtime.py` | Multi-platform local runtime validator |
 | `tools/install_runtime.sh` | Legacy portable installer (preserved) |
