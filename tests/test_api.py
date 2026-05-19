@@ -211,3 +211,116 @@ def test_niblit_full_flow_model_local_stop_tokens():
     assert payload["choices"][0]["message"]["role"] == "assistant"
     assert manager.last_chat_call["model_id"] == "demo-model"
     assert manager.last_chat_call["max_tokens"] == 200
+
+
+# ── Model switch tests ────────────────────────────────────────────────────────
+
+class TwoModelManager(ModelManager):
+    """Fake manager with two models: llama3 and qwen."""
+
+    def __init__(self):
+        super().__init__(
+            model_map={
+                "llama3": "/tmp/llama3.gguf",
+                "qwen": "/tmp/qwen.gguf",
+            },
+            default_model="llama3",
+        )
+        self.last_chat_call = None
+
+    def chat(self, model_id, messages, temperature, max_tokens):
+        self.last_chat_call = {"model_id": model_id, "messages": messages}
+        return ModelEngineResult(
+            text=f"[{model_id}] echo:{messages[-1]['content']}",
+            finish_reason="stop",
+        )
+
+
+def make_two_model_client() -> tuple[TestClient, TwoModelManager]:
+    manager = TwoModelManager()
+    app = create_app(model_manager=manager)
+    return TestClient(app), manager
+
+
+def test_active_model_endpoint_returns_current_default():
+    client, _ = make_two_model_client()
+    response = client.get("/v1/runtime/model/active")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["active_model"] == "llama3"
+    assert set(payload["available_models"]) == {"llama3", "qwen"}
+
+
+def test_switch_model_changes_active_model():
+    client, manager = make_two_model_client()
+    # Start on llama3
+    assert client.get("/v1/runtime/model/active").json()["active_model"] == "llama3"
+
+    # Switch to qwen
+    response = client.post("/v1/runtime/model/switch", json={"model_id": "qwen"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "switched"
+    assert payload["active_model"] == "qwen"
+    assert payload["previous_model"] == "llama3"
+
+    # Confirm active model endpoint reflects change
+    assert client.get("/v1/runtime/model/active").json()["active_model"] == "qwen"
+
+
+def test_switch_model_alias_local_follows_active_model():
+    """After switching to qwen, 'local' alias should route to qwen."""
+    client, manager = make_two_model_client()
+
+    # Switch active model to qwen
+    client.post("/v1/runtime/model/switch", json={"model_id": "qwen"})
+
+    # Send 'local' alias request — should now go to qwen
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "local",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert response.status_code == 200
+    assert manager.last_chat_call["model_id"] == "qwen"
+    assert "[qwen]" in response.json()["choices"][0]["message"]["content"]
+
+
+def test_switch_model_back_to_llama3():
+    """Can switch back from qwen to llama3."""
+    client, _ = make_two_model_client()
+
+    client.post("/v1/runtime/model/switch", json={"model_id": "qwen"})
+    resp = client.post("/v1/runtime/model/switch", json={"model_id": "llama3"})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "switched"
+    assert payload["active_model"] == "llama3"
+    assert payload["previous_model"] == "qwen"
+
+    # Active model endpoint must reflect the last switch
+    assert client.get("/v1/runtime/model/active").json()["active_model"] == "llama3"
+
+
+def test_switch_model_unknown_returns_404():
+    client, _ = make_two_model_client()
+    response = client.post("/v1/runtime/model/switch", json={"model_id": "gpt-unknown"})
+    assert response.status_code == 404
+
+
+def test_switch_model_explicit_request_model_overrides_active():
+    """Explicit model in request body always wins over the active default."""
+    client, manager = make_two_model_client()
+
+    # Active is llama3; explicitly request qwen
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "explicit"}],
+        },
+    )
+    assert response.status_code == 200
+    assert manager.last_chat_call["model_id"] == "qwen"
