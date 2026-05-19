@@ -236,12 +236,31 @@ class TwoModelManager(ModelManager):
         )
 
 
+class TwoModelReloadTrackingManager(TwoModelManager):
+    def __init__(self):
+        super().__init__()
+        self.reloaded_models = []
+
+    def reload_model(self, model_id):
+        self.reloaded_models.append(model_id)
+        return True
+
+
 def make_two_model_client() -> tuple[TestClient, TwoModelManager]:
     # Reset the orchestrator singleton so each test gets a clean health slate.
     import app.model_orchestrator as _orch_mod
     _orch_mod._orch = None
 
     manager = TwoModelManager()
+    app = create_app(model_manager=manager)
+    return TestClient(app), manager
+
+
+def make_two_model_reload_client() -> tuple[TestClient, TwoModelReloadTrackingManager]:
+    import app.model_orchestrator as _orch_mod
+    _orch_mod._orch = None
+
+    manager = TwoModelReloadTrackingManager()
     app = create_app(model_manager=manager)
     return TestClient(app), manager
 
@@ -270,6 +289,15 @@ def test_switch_model_changes_active_model():
 
     # Confirm active model endpoint reflects change
     assert client.get("/v1/runtime/model/active").json()["active_model"] == "qwen"
+
+
+def test_switch_model_triggers_reload_while_active():
+    client, manager = make_two_model_reload_client()
+    response = client.post("/v1/runtime/model/switch", json={"model_id": "qwen"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["reloaded"] is True
+    assert manager.reloaded_models == ["qwen"]
 
 
 def test_switch_model_alias_local_follows_active_model():

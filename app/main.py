@@ -153,6 +153,35 @@ class ModelManager:
         logger.info("Active model switched: %s -> %s", previous, model_id)
         return previous or ""
 
+    def reload_model(self, model_id: str) -> bool:
+        """Best-effort hot reload for a specific model while server stays online.
+
+        Returns True when a fresh engine instance is loaded, False when reload is
+        skipped (for example, model file path does not exist).
+        """
+        with self._lock:
+            if model_id not in self._model_map:
+                raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+            model_path = self._model_map[model_id]
+
+        if not os.path.isfile(model_path):
+            logger.warning("Skipping reload for model %s: file not found at %s", model_id, model_path)
+            return False
+
+        try:
+            engine = GGUFEngine(
+                model_path=model_path,
+                n_ctx=self._n_ctx,
+                n_threads=self._n_threads,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        with self._lock:
+            self._engines[model_id] = engine
+        logger.info("Model reloaded successfully: %s", model_id)
+        return True
+
     def list_models(self) -> list[dict[str, str]]:
         return [{"id": model_id, "object": "model"} for model_id in self._model_map]
 
@@ -732,6 +761,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         """
         manager: ModelManager = app.state.model_manager
         previous = manager.set_active_model(payload.model_id)
+        reloaded = manager.reload_model(payload.model_id)
         if _orchestrator_mod:
             try:
                 _orchestrator_mod.get_model_orchestrator().register_model(payload.model_id)
@@ -742,6 +772,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             "status": "switched",
             "active_model": payload.model_id,
             "previous_model": previous,
+            "reloaded": reloaded,
         }
 
     @app.get("/v1/runtime/reflection")
