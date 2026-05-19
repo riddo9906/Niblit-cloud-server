@@ -154,7 +154,7 @@ class ModelManager:
         return previous or ""
 
     def reload_model(self, model_id: str) -> bool:
-        """Best-effort hot reload for a specific model while server stays online.
+        """Hot reload a specific model while the server stays online.
 
         Returns True when a fresh engine instance is loaded.
 

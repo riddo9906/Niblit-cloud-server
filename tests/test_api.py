@@ -236,6 +236,8 @@ class TwoModelManager(ModelManager):
         )
 
     def reload_model(self, model_id):
+        if model_id not in self._model_map:
+            return super().reload_model(model_id)
         return True
 
 
