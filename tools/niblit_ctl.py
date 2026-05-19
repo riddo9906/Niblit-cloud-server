@@ -41,8 +41,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("compatibility")
     sub.add_parser("active-model")
 
-    switch = sub.add_parser("switch-model", help="Switch the active GGUF model (e.g. llama3 or qwen)")
+    switch = sub.add_parser(
+        "switch-model",
+        aliases=["swap-model", "model-swap"],
+        help="Switch the active GGUF model (e.g. llama3 or qwen)",
+    )
     switch.add_argument("model_id", help="Model ID to activate (must be registered in GGUF_MODELS_JSON)")
+
+    model = sub.add_parser("model", help="Model commands (active/swap)")
+    model_sub = model.add_subparsers(dest="model_command", required=True)
+    model_sub.add_parser("active", help="Show currently active model")
+    model_swap = model_sub.add_parser("swap", aliases=["switch"], help="Swap active model")
+    model_swap.add_argument("model_id", help="Model ID to activate (must be registered in GGUF_MODELS_JSON)")
 
     chat = sub.add_parser("chat")
     chat.add_argument("message", nargs="?", default="hello from niblit_ctl")
@@ -83,7 +93,11 @@ def main(argv: list[str] | None = None) -> int:
         return _print(client.compatibility(), args.output, client)
     if args.command == "active-model":
         return _print(client.active_model(), args.output, client)
-    if args.command == "switch-model":
+    if args.command in ("switch-model", "swap-model", "model-swap"):
+        return _print(client.switch_model(args.model_id), args.output, client)
+    if args.command == "model" and args.model_command == "active":
+        return _print(client.active_model(), args.output, client)
+    if args.command == "model" and args.model_command in ("swap", "switch"):
         return _print(client.switch_model(args.model_id), args.output, client)
     if args.command == "chat":
         return _print(

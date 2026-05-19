@@ -569,6 +569,57 @@ class TestBackwardCompatibility:
 
         assert callable(niblit_ctl.main)
 
+    def test_niblit_ctl_model_swap_command_aliases(self, monkeypatch, capsys):
+        from tools import niblit_ctl
+
+        class _Resp:
+            ok = True
+            data = {"status": "ok"}
+
+        class _DummyClient:
+            def __init__(self, *_args, **_kwargs):
+                self.calls = []
+
+            def render(self, resp, mode="pretty"):
+                assert mode in ("pretty", "json", "raw")
+                return json.dumps(resp.data)
+
+            def switch_model(self, model_id):
+                self.calls.append(("switch_model", model_id))
+                return _Resp()
+
+            def active_model(self):
+                self.calls.append(("active_model", None))
+                return _Resp()
+
+        holder: dict[str, _DummyClient] = {}
+
+        def _factory(*args, **kwargs):
+            holder["client"] = _DummyClient(*args, **kwargs)
+            return holder["client"]
+
+        monkeypatch.setattr(niblit_ctl, "SidecarClient", _factory)
+
+        swap_variants = [
+            ["switch-model", "qwen"],
+            ["swap-model", "qwen"],
+            ["model-swap", "qwen"],
+            ["model", "swap", "qwen"],
+            ["model", "switch", "qwen"],
+        ]
+        for argv in swap_variants:
+            assert niblit_ctl.main(argv) == 0
+            assert holder["client"].calls == [("switch_model", "qwen")]
+            holder.clear()
+
+        assert niblit_ctl.main(["active-model"]) == 0
+        assert holder["client"].calls == [("active_model", None)]
+        holder.clear()
+
+        assert niblit_ctl.main(["model", "active"]) == 0
+        assert holder["client"].calls == [("active_model", None)]
+        capsys.readouterr()
+
     def test_runtime_profiles_do_not_modify_env_on_import(self):
         """Importing runtime_profiles must not side-effect os.environ."""
         import os
