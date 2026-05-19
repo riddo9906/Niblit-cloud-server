@@ -1,3 +1,4 @@
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import ModelEngineResult, ModelManager, create_app
@@ -266,6 +267,11 @@ class TwoModelMissingFileReloadManager(ModelManager):
             text=f"[{model_id}] echo:{messages[-1]['content']}",
             finish_reason="stop",
         )
+
+    def reload_model(self, model_id):
+        if model_id not in self._model_map:
+            raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+        raise HTTPException(status_code=404, detail="Model file not found: /tmp/does-not-exist.gguf")
 
 
 def make_two_model_client() -> tuple[TestClient, TwoModelManager]:
