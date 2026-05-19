@@ -91,13 +91,11 @@ def main(argv: list[str] | None = None) -> int:
         return _print(client.topology(), args.output, client)
     if args.command == "compatibility":
         return _print(client.compatibility(), args.output, client)
-    if args.command == "active-model":
+    if args.command == "active-model" or (args.command == "model" and args.model_command == "active"):
         return _print(client.active_model(), args.output, client)
-    if args.command in ("switch-model", "swap-model", "model-swap"):
-        return _print(client.switch_model(args.model_id), args.output, client)
-    if args.command == "model" and args.model_command == "active":
-        return _print(client.active_model(), args.output, client)
-    if args.command == "model" and args.model_command in ("swap", "switch"):
+    if args.command in ("switch-model", "swap-model", "model-swap") or (
+        args.command == "model" and args.model_command in ("swap", "switch")
+    ):
         return _print(client.switch_model(args.model_id), args.output, client)
     if args.command == "chat":
         return _print(

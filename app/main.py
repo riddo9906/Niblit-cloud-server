@@ -760,8 +760,8 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         Returns 404 if *model_id* is not registered in GGUF_MODELS_JSON.
         """
         manager: ModelManager = app.state.model_manager
-        previous = manager.set_active_model(payload.model_id)
         reloaded = manager.reload_model(payload.model_id)
+        previous = manager.set_active_model(payload.model_id)
         if _orchestrator_mod:
             try:
                 _orchestrator_mod.get_model_orchestrator().register_model(payload.model_id)
