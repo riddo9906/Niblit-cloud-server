@@ -249,6 +249,23 @@ class TwoModelReloadTrackingManager(TwoModelManager):
         return True
 
 
+class TwoModelMissingFileReloadManager(ModelManager):
+    def __init__(self):
+        super().__init__(
+            model_map={
+                "llama3": "/tmp/llama3.gguf",
+                "qwen": "/tmp/does-not-exist.gguf",
+            },
+            default_model="llama3",
+        )
+
+    def chat(self, model_id, messages, temperature, max_tokens):
+        return ModelEngineResult(
+            text=f"[{model_id}] echo:{messages[-1]['content']}",
+            finish_reason="stop",
+        )
+
+
 def make_two_model_client() -> tuple[TestClient, TwoModelManager]:
     # Reset the orchestrator singleton so each test gets a clean health slate.
     import app.model_orchestrator as _orch_mod
@@ -264,6 +281,15 @@ def make_two_model_reload_client() -> tuple[TestClient, TwoModelReloadTrackingMa
     _orch_mod._orch = None
 
     manager = TwoModelReloadTrackingManager()
+    app = create_app(model_manager=manager)
+    return TestClient(app), manager
+
+
+def make_two_model_missing_reload_client() -> tuple[TestClient, TwoModelMissingFileReloadManager]:
+    import app.model_orchestrator as _orch_mod
+    _orch_mod._orch = None
+
+    manager = TwoModelMissingFileReloadManager()
     app = create_app(model_manager=manager)
     return TestClient(app), manager
 
@@ -301,6 +327,13 @@ def test_switch_model_triggers_reload_while_active():
     payload = response.json()
     assert payload["reloaded"] is True
     assert manager.reloaded_models == ["qwen"]
+
+
+def test_switch_model_reload_failure_keeps_previous_active():
+    client, manager = make_two_model_missing_reload_client()
+    response = client.post("/v1/runtime/model/switch", json={"model_id": "qwen"})
+    assert response.status_code == 404
+    assert manager.get_active_model_id() == "llama3"
 
 
 def test_switch_model_alias_local_follows_active_model():
