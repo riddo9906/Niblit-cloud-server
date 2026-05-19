@@ -235,6 +235,9 @@ class TwoModelManager(ModelManager):
             finish_reason="stop",
         )
 
+    def reload_model(self, model_id):
+        return True
+
 
 class TwoModelReloadTrackingManager(TwoModelManager):
     def __init__(self):

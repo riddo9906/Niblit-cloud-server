@@ -156,8 +156,11 @@ class ModelManager:
     def reload_model(self, model_id: str) -> bool:
         """Best-effort hot reload for a specific model while server stays online.
 
-        Returns True when a fresh engine instance is loaded, False when reload is
-        skipped (for example, model file path does not exist).
+        Returns True when a fresh engine instance is loaded.
+
+        Raises HTTPException:
+        - 404 if model_id is unknown or the model file path does not exist.
+        - 502 if the backend engine fails to initialize for the model.
         """
         with self._lock:
             if model_id not in self._model_map:
@@ -165,8 +168,7 @@ class ModelManager:
             model_path = self._model_map[model_id]
 
         if not os.path.isfile(model_path):
-            logger.warning("Skipping reload for model %s: file not found at %s", model_id, model_path)
-            return False
+            raise HTTPException(status_code=404, detail=f"Model file not found: {model_path}")
 
         try:
             engine = GGUFEngine(
