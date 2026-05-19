@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -117,6 +118,7 @@ class ModelManager:
         self._engines: dict[str, GGUFEngine] = {}
         self._n_ctx = int(os.getenv("N_CTX", "4096"))
         self._n_threads = int(os.getenv("N_THREADS", "4"))
+        self._lock = threading.Lock()
         logger.info(
             "ModelManager initialized: models=%s default=%s n_ctx=%d n_threads=%d",
             list(model_map.keys()),
@@ -127,9 +129,29 @@ class ModelManager:
 
     def get_default_model_info(self) -> dict[str, str]:
         """Return {model_id, model_path} for the default model (empty strings if none)."""
-        model_id = self._default_model or ""
-        model_path = self._model_map.get(model_id, "") if model_id else ""
+        with self._lock:
+            model_id = self._default_model or ""
+            model_path = self._model_map.get(model_id, "") if model_id else ""
         return {"model_id": model_id, "model_path": model_path}
+
+    def get_active_model_id(self) -> str | None:
+        """Return the current active/default model ID."""
+        with self._lock:
+            return self._default_model
+
+    def set_active_model(self, model_id: str) -> str:
+        """Switch the active (default) model to *model_id*.
+
+        Returns the previous active model ID.  Raises HTTPException 404 if
+        *model_id* is not registered.
+        """
+        with self._lock:
+            if model_id not in self._model_map:
+                raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+            previous = self._default_model
+            self._default_model = model_id
+        logger.info("Active model switched: %s -> %s", previous, model_id)
+        return previous or ""
 
     def list_models(self) -> list[dict[str, str]]:
         return [{"id": model_id, "object": "model"} for model_id in self._model_map]
@@ -147,12 +169,14 @@ class ModelManager:
         Niblit's ``QwenLocalBrain`` HTTP backend — which always sends
         ``"model": "local"`` — works without any client-side configuration.
         """
-        model_id = request_model or path_model or self._default_model
+        with self._lock:
+            default = self._default_model
+        model_id = request_model or path_model or default
         if not model_id:
             raise HTTPException(status_code=400, detail="No model provided.")
         # Resolve well-known aliases (e.g. "local" sent by Niblit's local_brain)
         if model_id.lower() in _LOCAL_MODEL_ALIASES:
-            if not self._default_model:
+            if not default:
                 raise HTTPException(
                     status_code=503,
                     detail=(
@@ -160,7 +184,7 @@ class ModelManager:
                         "configured. Set DEFAULT_MODEL_ID and GGUF_MODELS_JSON."
                     ),
                 )
-            return self._default_model
+            return default
         if model_id not in self._model_map:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
         return model_id
@@ -680,6 +704,45 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             except Exception:
                 result["orchestrator_error"] = "unavailable"
         return result
+
+    # ── Model switch endpoints ─────────────────────────────────────────────────
+
+    class ModelSwitchRequest(BaseModel):
+        model_id: str
+
+    @app.get("/v1/runtime/model/active")
+    def get_active_model() -> dict[str, Any]:
+        """Return the currently active (default) model and all registered models."""
+        manager: ModelManager = app.state.model_manager
+        active = manager.get_active_model_id()
+        return {
+            "active_model": active or "",
+            "available_models": [m["id"] for m in manager.list_models()],
+        }
+
+    @app.post("/v1/runtime/model/switch")
+    def switch_model(payload: ModelSwitchRequest) -> dict[str, Any]:
+        """Switch the active model to *payload.model_id* while the server is running.
+
+        Both llama3 and qwen (or any other registered GGUF) model IDs are
+        accepted.  The new default is applied immediately — subsequent requests
+        that use the ``"local"`` alias will be routed to the switched model.
+
+        Returns 404 if *model_id* is not registered in GGUF_MODELS_JSON.
+        """
+        manager: ModelManager = app.state.model_manager
+        previous = manager.set_active_model(payload.model_id)
+        if _orchestrator_mod:
+            try:
+                _orchestrator_mod.get_model_orchestrator().register_model(payload.model_id)
+            except Exception as exc:
+                logger.warning("switch_model: orchestrator registration failed: %s", exc)
+        logger.info("Model switch requested: %s -> %s", previous, payload.model_id)
+        return {
+            "status": "switched",
+            "active_model": payload.model_id,
+            "previous_model": previous,
+        }
 
     @app.get("/v1/runtime/reflection")
     def runtime_reflection() -> dict[str, Any]:

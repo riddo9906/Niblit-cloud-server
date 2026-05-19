@@ -201,6 +201,14 @@ class SidecarClient:
         }
         return self.post("/federation/governance/sync", payload)
 
+    def active_model(self) -> SidecarResponse:
+        """Return the currently active model and all registered models."""
+        return self.get("/v1/runtime/model/active")
+
+    def switch_model(self, model_id: str) -> SidecarResponse:
+        """Switch the active model to *model_id* while the server is running."""
+        return self.post("/v1/runtime/model/switch", {"model_id": model_id})
+
     def chat(
         self,
         messages: list[dict[str, str]],

@@ -227,7 +227,12 @@ class ModelOrchestrator:
         with self._lock:
             ranked = sorted(
                 [mid for mid in available if mid in self._health],
-                key=lambda m: self._health[m].composite_score,
+                key=lambda m: (
+                    self._health[m].composite_score,
+                    # Use the default/requested model as a tiebreaker so the
+                    # active model wins when all candidates have equal health.
+                    1 if m == default else 0,
+                ),
                 reverse=True,
             )
             # Add unregistered models at the end

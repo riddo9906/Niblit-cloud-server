@@ -39,6 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("federation")
     sub.add_parser("topology")
     sub.add_parser("compatibility")
+    sub.add_parser("active-model")
+
+    switch = sub.add_parser("switch-model", help="Switch the active GGUF model (e.g. llama3 or qwen)")
+    switch.add_argument("model_id", help="Model ID to activate (must be registered in GGUF_MODELS_JSON)")
 
     chat = sub.add_parser("chat")
     chat.add_argument("message", nargs="?", default="hello from niblit_ctl")
@@ -77,6 +81,10 @@ def main(argv: list[str] | None = None) -> int:
         return _print(client.topology(), args.output, client)
     if args.command == "compatibility":
         return _print(client.compatibility(), args.output, client)
+    if args.command == "active-model":
+        return _print(client.active_model(), args.output, client)
+    if args.command == "switch-model":
+        return _print(client.switch_model(args.model_id), args.output, client)
     if args.command == "chat":
         return _print(
             client.chat(messages=[{"role": "user", "content": args.message}]),
