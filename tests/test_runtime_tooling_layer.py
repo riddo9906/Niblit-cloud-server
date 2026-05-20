@@ -189,7 +189,7 @@ class TestRuntimeProfiles:
         env.pop("NIBLIT_LLAMA_SERVER_BIN", None)
 
         result = subprocess.run(
-            ["bash", str(repo_root / "tools/termux_inference_server.sh"), "--profile", "termux-local", "--dry-run"],
+            ["bash", str(repo_root / "tools/qwen_server.sh"), "--profile", "termux-local", "--dry-run"],
             cwd=repo_root,
             env=env,
             capture_output=True,
