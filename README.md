@@ -85,8 +85,11 @@ See `.env.example` for all options.
 | `GGUF_MODELS_JSON` | `{}` | JSON map of `model_id → gguf_path` |
 | `DEFAULT_MODEL_ID` | first model | Default model if request omits model |
 | `COMPAT_PREFIXES` | `hf,local,kimi,claude` | Compatibility URL prefixes |
-| `N_CTX` | `4096` | llama.cpp context length |
+| `N_CTX` | `16384` | llama.cpp context length (16K target) |
 | `N_THREADS` | `4` | llama.cpp thread count |
+| `NIBLIT_N_BATCH` | `1024` | llama.cpp batch size hint |
+| `NIBLIT_N_UBATCH` | `512` | llama.cpp micro-batch size hint |
+| `NIBLIT_CONTEXT_RESERVE_TOKENS` | `512` | reserved context for stability guards |
 
 ### Cognitive Runtime (Phase Ω.7)
 
@@ -96,6 +99,7 @@ See `.env.example` for all options.
 | `NIBLIT_CG_ENABLED` | `1` | Enable constitutional governance |
 | `NIBLIT_CG_STRICT` | `1` | Strict mode (blocks violations) |
 | `NIBLIT_CG_MAX_TOKENS` | `8192` | Hard token ceiling |
+| `NIBLIT_CG_MAX_CONTEXT_TOKENS` | `16384` | Hard prompt+completion context ceiling |
 | `NIBLIT_RE_ENABLED` | `1` | Enable reflection engine |
 | `NIBLIT_AA_ENABLED` | `1` | Enable attention economy |
 | `NIBLIT_TRADING_BRIDGE_ENABLED` | `1` | Enable trading bridge |
