@@ -30,6 +30,7 @@ Configuration (env vars)
     NIBLIT_CG_ENABLED         — "0" to disable (default 1)
     NIBLIT_CG_STRICT          — "0" for permissive mode (default 1)
     NIBLIT_CG_MAX_TOKENS      — hard token ceiling (default 8192)
+    NIBLIT_CG_MAX_CONTEXT_TOKENS — hard prompt+completion ceiling (default 16384)
     NIBLIT_CG_MAX_RECURSION   — max recursion depth (default 16)
 """
 
@@ -47,6 +48,7 @@ _ENABLED: bool = os.getenv("NIBLIT_CG_ENABLED", "1").strip() not in ("0", "false
 _STRICT: bool = os.getenv("NIBLIT_CG_STRICT", "1").strip() not in ("0", "false")
 _MAX_TOKENS: int = int(os.getenv("NIBLIT_CG_MAX_TOKENS", "8192"))
 _MAX_RECURSION: int = int(os.getenv("NIBLIT_CG_MAX_RECURSION", "16"))
+_MAX_CONTEXT_TOKENS: int = int(os.getenv("NIBLIT_CG_MAX_CONTEXT_TOKENS", "16384"))
 
 # ── Constitutional law constants ───────────────────────────────────────────────
 LAW_PRESERVE_INTEGRITY    = "law_1_preserve_system_integrity"
@@ -172,9 +174,17 @@ class CloudGovernance:
         env = dict(envelope or {})
         violated: list[str] = []
         rationale: dict[str, Any] = {}
+        estimated_total_tokens = int(ctx.get("estimated_total_tokens", 0) or 0)
+        context_window = int(ctx.get("context_window", _MAX_CONTEXT_TOKENS))
 
         # ── Cloud guards (always enforced regardless of strict mode) ───────────
-        self._check_token_limit(max_tokens, violated, rationale)
+        self._check_token_limit(
+            max_tokens,
+            violated,
+            rationale,
+            estimated_total_tokens=estimated_total_tokens,
+            context_window=context_window,
+        )
         self._check_recursion(ctx, violated, rationale)
         self._check_injection(messages or [], violated, rationale)
         self._check_lockdown(env, violated, rationale)
@@ -232,6 +242,7 @@ class CloudGovernance:
                 "enabled": _ENABLED,
                 "strict_mode": _STRICT,
                 "max_tokens_limit": _MAX_TOKENS,
+                "max_context_tokens": _MAX_CONTEXT_TOKENS,
                 "max_recursion_limit": _MAX_RECURSION,
                 "validation_count": self._validation_count,
                 "block_count": self._block_count,
@@ -245,13 +256,27 @@ class CloudGovernance:
     # ── Cloud guards ───────────────────────────────────────────────────────────
 
     def _check_token_limit(
-        self, max_tokens: int, violated: list[str], rationale: dict[str, Any]
+        self,
+        max_tokens: int,
+        violated: list[str],
+        rationale: dict[str, Any],
+        *,
+        estimated_total_tokens: int = 0,
+        context_window: int = _MAX_CONTEXT_TOKENS,
     ) -> None:
         if max_tokens > _MAX_TOKENS:
             violated.append(GUARD_TOKEN_LIMIT)
             rationale["token_limit"] = {
                 "requested": max_tokens,
                 "hard_limit": _MAX_TOKENS,
+            }
+        total_cap = min(_MAX_CONTEXT_TOKENS, context_window)
+        if estimated_total_tokens > total_cap:
+            violated.append(GUARD_RUNAWAY_TOKENS)
+            rationale["runaway_tokens"] = {
+                "estimated_total_tokens": estimated_total_tokens,
+                "context_window": context_window,
+                "max_context_tokens": _MAX_CONTEXT_TOKENS,
             }
 
     def _check_recursion(

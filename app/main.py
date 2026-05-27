@@ -6,9 +6,10 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generator
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,27 @@ _LOCAL_MODEL_ALIASES: frozenset[str] = frozenset({"local", "llama", "default"})
 _DEFAULT_TEMPERATURE: float = 0.2
 _DEFAULT_MAX_TOKENS: int = 256
 _CANONICAL_MODES: tuple[str, ...] = ("normal", "cautious", "survival", "lockdown")
+_MESSAGE_OVERHEAD_CHARS: int = 8
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float | None = None) -> float | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 def _normalize_runtime_mode(mode: object, default: str = "normal") -> str:
@@ -65,7 +87,13 @@ class ModelEngineResult:
 
 
 class GGUFEngine:
-    def __init__(self, model_path: str, n_ctx: int, n_threads: int):
+    def __init__(
+        self,
+        model_path: str,
+        n_ctx: int,
+        n_threads: int,
+        runtime_options: dict[str, Any] | None = None,
+    ):
         logger.info("Loading model from %s (n_ctx=%d, n_threads=%d)", model_path, n_ctx, n_threads)
         try:
             from llama_cpp import Llama
@@ -73,7 +101,21 @@ class GGUFEngine:
             raise RuntimeError(
                 "llama-cpp-python is required to run GGUF inference."
             ) from exc
-        self._llm = Llama(model_path=model_path, n_ctx=n_ctx, n_threads=n_threads)
+        kwargs: dict[str, Any] = {
+            "model_path": model_path,
+            "n_ctx": n_ctx,
+            "n_threads": n_threads,
+        }
+        for key, value in (runtime_options or {}).items():
+            if value is not None:
+                kwargs[key] = value
+        try:
+            self._llm = Llama(**kwargs)
+        except TypeError:
+            logger.warning(
+                "llama_cpp runtime options unsupported by current build; falling back to core args."
+            )
+            self._llm = Llama(model_path=model_path, n_ctx=n_ctx, n_threads=n_threads)
         logger.info("Model loaded successfully from %s", model_path)
 
     def chat(
@@ -116,15 +158,40 @@ class ModelManager:
         self._model_map = model_map
         self._default_model = default_model or (next(iter(model_map), None))
         self._engines: dict[str, GGUFEngine] = {}
-        self._n_ctx = int(os.getenv("N_CTX", "4096"))
-        self._n_threads = int(os.getenv("N_THREADS", "4"))
+        self._n_ctx = _env_int("N_CTX", _env_int("NIBLIT_CONTEXT_WINDOW", 16384))
+        self._n_threads = _env_int("N_THREADS", 4)
+        self._n_batch = _env_int("NIBLIT_N_BATCH", _env_int("N_BATCH", 1024))
+        self._n_ubatch = _env_int("NIBLIT_N_UBATCH", _env_int("N_UBATCH", 512))
+        self._context_reserve_tokens = _env_int("NIBLIT_CONTEXT_RESERVE_TOKENS", 512)
+        self._min_generation_tokens = _env_int("NIBLIT_MIN_GENERATION_TOKENS", 64)
+        self._char_to_token_ratio = max(1, _env_int("NIBLIT_CHAR_PER_TOKEN", 4))
+        self._memory_guard_ratio = max(
+            0.5,
+            min(0.98, _env_float("NIBLIT_MEMORY_GUARD_RATIO", 0.92) or 0.92),
+        )
+        self._runtime_options = {
+            "n_batch": self._n_batch,
+            "n_ubatch": self._n_ubatch,
+            "rope_freq_base": _env_float("NIBLIT_ROPE_FREQ_BASE", None),
+            "rope_freq_scale": _env_float("NIBLIT_ROPE_FREQ_SCALE", None),
+        }
+        self._stats: dict[str, Any] = {
+            "requests_total": 0,
+            "context_trim_events": 0,
+            "max_token_clamp_events": 0,
+            "last_prompt_tokens_estimate": 0,
+            "last_effective_max_tokens": 0,
+            "last_context_usage_ratio": 0.0,
+        }
         self._lock = threading.Lock()
         logger.info(
-            "ModelManager initialized: models=%s default=%s n_ctx=%d n_threads=%d",
+            "ModelManager initialized: models=%s default=%s n_ctx=%d n_threads=%d n_batch=%d n_ubatch=%d",
             list(model_map.keys()),
             self._default_model,
             self._n_ctx,
             self._n_threads,
+            self._n_batch,
+            self._n_ubatch,
         )
 
     def get_default_model_info(self) -> dict[str, str]:
@@ -175,6 +242,7 @@ class ModelManager:
                 model_path=model_path,
                 n_ctx=self._n_ctx,
                 n_threads=self._n_threads,
+                runtime_options=self._runtime_options,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -228,21 +296,40 @@ class ModelManager:
                 model_path=self._model_map[model_id],
                 n_ctx=self._n_ctx,
                 n_threads=self._n_threads,
+                runtime_options=self._runtime_options,
             )
+        plan = self._prepare_inference(messages=messages, max_tokens=max_tokens)
         logger.debug(
-            "chat request: model=%s messages=%d temperature=%s max_tokens=%d",
+            "chat request: model=%s messages=%d temperature=%s max_tokens=%d effective_max_tokens=%d",
             model_id,
             len(messages),
             temperature,
             max_tokens,
+            plan["effective_max_tokens"],
         )
         try:
             result = self._engines[model_id].chat(
-                messages=messages, temperature=temperature, max_tokens=max_tokens
+                messages=plan["messages"], temperature=temperature, max_tokens=plan["effective_max_tokens"]
             )
         except RuntimeError as exc:
             logger.error("Inference error for model %s: %s", model_id, exc)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        with self._lock:
+            self._stats["requests_total"] += 1
+            if plan["messages_truncated"]:
+                self._stats["context_trim_events"] += 1
+                logger.info(
+                    "Context truncation applied for model=%s prompt_tokens=%d requested_max_tokens=%d effective_max_tokens=%d",
+                    model_id,
+                    plan["prompt_tokens_estimate"],
+                    max_tokens,
+                    plan["effective_max_tokens"],
+                )
+            if plan["effective_max_tokens"] < max_tokens:
+                self._stats["max_token_clamp_events"] += 1
+            self._stats["last_prompt_tokens_estimate"] = plan["prompt_tokens_estimate"]
+            self._stats["last_effective_max_tokens"] = plan["effective_max_tokens"]
+            self._stats["last_context_usage_ratio"] = round(plan["context_usage_ratio"], 4)
         logger.debug(
             "chat response: model=%s finish_reason=%s",
             model_id,
@@ -250,12 +337,91 @@ class ModelManager:
         )
         return result
 
+    def estimate_inference(self, messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:
+        return self._prepare_inference(messages=messages, max_tokens=max_tokens)
+
+    def runtime_stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                **self._stats,
+                "context_window": self._n_ctx,
+                "n_batch": self._n_batch,
+                "n_ubatch": self._n_ubatch,
+                "context_reserve_tokens": self._context_reserve_tokens,
+                "memory_guard_ratio": self._memory_guard_ratio,
+            }
+
+    def _estimate_tokens(self, messages: list[dict[str, str]]) -> int:
+        total_chars = 0
+        for msg in messages:
+            total_chars += (
+                len(msg.get("content", ""))
+                + len(msg.get("role", ""))
+                + _MESSAGE_OVERHEAD_CHARS
+            )
+        return max(1, total_chars // self._char_to_token_ratio)
+
+    def _prepare_inference(self, messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:
+        source_messages = [dict(m) for m in messages]
+        safe_messages = [dict(m) for m in messages]
+        requested_max_tokens = max(1, int(max_tokens))
+        target_ctx_budget = max(256, int(self._n_ctx * self._memory_guard_ratio))
+
+        prompt_tokens = self._estimate_tokens(safe_messages)
+        min_generation = max(16, min(self._min_generation_tokens, requested_max_tokens))
+        max_prompt_budget = max(64, target_ctx_budget - max(self._context_reserve_tokens, min_generation))
+        messages_truncated = False
+
+        if prompt_tokens > max_prompt_budget and safe_messages:
+            kept: list[dict[str, str]] = []
+            running_tokens = 0
+            for msg in reversed(safe_messages):
+                msg_tokens = self._estimate_tokens([msg])
+                if kept and (running_tokens + msg_tokens) > max_prompt_budget:
+                    messages_truncated = True
+                    continue
+                kept.append(msg)
+                running_tokens += msg_tokens
+                if running_tokens >= max_prompt_budget:
+                    break
+            safe_messages = list(reversed(kept)) or [source_messages[-1]]
+
+            if safe_messages:
+                prompt_tokens = self._estimate_tokens(safe_messages)
+            if prompt_tokens > max_prompt_budget and safe_messages:
+                last = dict(safe_messages[-1])
+                max_chars = max(64, max_prompt_budget * self._char_to_token_ratio)
+                if len(last.get("content", "")) > max_chars:
+                    last["content"] = last["content"][-max_chars:]
+                    safe_messages[-1] = last
+                    messages_truncated = True
+                prompt_tokens = self._estimate_tokens(safe_messages)
+
+        available_for_generation = max(
+            1,
+            target_ctx_budget - prompt_tokens - self._context_reserve_tokens,
+        )
+        effective_max_tokens = max(1, min(requested_max_tokens, available_for_generation))
+        context_usage_ratio = (prompt_tokens + effective_max_tokens) / max(1, self._n_ctx)
+        memory_pressure = min(1.0, (prompt_tokens + requested_max_tokens) / max(1, target_ctx_budget))
+        return {
+            "messages": safe_messages,
+            "messages_truncated": messages_truncated,
+            "prompt_tokens_estimate": prompt_tokens,
+            "requested_max_tokens": requested_max_tokens,
+            "effective_max_tokens": effective_max_tokens,
+            "context_usage_ratio": context_usage_ratio,
+            "memory_pressure": memory_pressure,
+            "target_ctx_budget": target_ctx_budget,
+        }
+
 
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
     temperature: float = _DEFAULT_TEMPERATURE
     max_tokens: int = _DEFAULT_MAX_TOKENS
+    stream: bool = False
     # Accepted for llama-server API compatibility; passed through to the engine.
     stop: list[str] | None = None
     # Tool schemas (Niblit generate_with_tools); accepted and ignored if not supported.
@@ -478,9 +644,17 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         request_id = uuid.uuid4().hex
 
         manager: ModelManager = app.state.model_manager
+        messages = _normalize_messages(payload.messages)
+        inference_plan = manager.estimate_inference(messages=messages, max_tokens=payload.max_tokens)
 
         # ── Build cognitive envelope ───────────────────────────────────────────
         envelope = _extract_envelope(payload)
+        if inference_plan["memory_pressure"] >= 0.85:
+            envelope["resource_mode"] = "conservative"
+            runtime_ctx = dict(envelope.get("runtime") or {})
+            runtime_ctx["mode"] = "cautious"
+            runtime_ctx["attention_pressure"] = min(1.0, inference_plan["memory_pressure"])
+            envelope["runtime"] = runtime_ctx
 
         # ── Attention allocation ───────────────────────────────────────────────
         allocation = None
@@ -509,8 +683,15 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             try:
                 verdict = _governance_mod.get_cloud_governance().validate(
                     action="chat_inference",
+                    context={
+                        "prompt_tokens_estimate": inference_plan["prompt_tokens_estimate"],
+                        "estimated_total_tokens": (
+                            inference_plan["prompt_tokens_estimate"] + payload.max_tokens
+                        ),
+                        "context_window": manager.runtime_stats().get("context_window"),
+                    },
                     envelope=envelope,
-                    messages=payload.messages,
+                    messages=messages,
                     max_tokens=payload.max_tokens,
                 )
                 if not verdict.allowed:
@@ -556,7 +737,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             except Exception:
                 pass
 
-        messages = _normalize_messages(payload.messages)
         result = manager.chat(
             model_id=request_model_id,
             messages=messages,
@@ -607,14 +787,57 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 "intent": envelope.get("intent"),
                 "governance_mode": (envelope.get("governance") or {}).get("governance_mode", "normal"),
                 "latency_ms": round(latency_ms, 1),
+                "context": {
+                    "window": manager.runtime_stats().get("context_window"),
+                    "prompt_tokens_estimate": inference_plan["prompt_tokens_estimate"],
+                    "effective_max_tokens": manager.runtime_stats().get("last_effective_max_tokens"),
+                    "messages_truncated": bool(inference_plan["messages_truncated"]),
+                    "memory_pressure": round(inference_plan["memory_pressure"], 4),
+                },
             }
 
         return response
 
+    def stream_chat_completion(
+        payload: ChatCompletionRequest, path_model: str | None = None
+    ) -> Generator[str, None, None]:
+        response = handle_chat(payload, path_model)
+        model_id = str(response.get("model", payload.model or ""))
+        choice = ((response.get("choices") or [{}])[0]) if isinstance(response, dict) else {}
+        message = choice.get("message") if isinstance(choice, dict) else {}
+        content = message.get("content", "") if isinstance(message, dict) else ""
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created_ts = int(time.time())
+
+        first = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": model_id,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}],
+        }
+        final = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": model_id,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(first)}\n\n"
+        yield f"data: {json.dumps(final)}\n\n"
+        yield "data: [DONE]\n\n"
+
     @app.post("/v1/chat/completions")
     @app.post("/chat/completions")
     @app.post("/v1/models/{path_model}/chat/completions")
-    def chat_completions(payload: ChatCompletionRequest, path_model: str | None = None) -> dict[str, Any]:
+    def chat_completions(
+        payload: ChatCompletionRequest, path_model: str | None = None
+    ) -> Any:
+        if payload.stream:
+            return StreamingResponse(
+                stream_chat_completion(payload, path_model),
+                media_type="text/event-stream",
+            )
         return handle_chat(payload, path_model)
 
     @app.post("/completion")
@@ -671,6 +894,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             "phase": "omega.9",
             "models": manager.list_models(),
             "default_model": manager.get_default_model_info(),
+            "context_runtime": manager.runtime_stats(),
         }
         if _identity_mod:
             try:
@@ -913,10 +1137,12 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     @app.get("/v1/runtime/diagnostics")
     def runtime_diagnostics() -> dict[str, Any]:
         """Operational diagnostics for governance-aware runtime operations."""
+        manager: ModelManager = app.state.model_manager
         diagnostics: dict[str, Any] = {
             "runtime_health": 1.0,
             "inference_pressure": {},
             "attention_pressure": {},
+            "context_runtime": {},
             "model_latency_ema": {},
             "governance_violations": {},
             "thermal_resource_state": {
@@ -950,6 +1176,13 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                     diagnostics["thermal_resource_state"]["resource_mode"] = "minimal"
             except Exception:
                 pass
+
+        try:
+            diagnostics["context_runtime"] = manager.runtime_stats()
+            if diagnostics["context_runtime"].get("last_context_usage_ratio", 0.0) >= 0.9:
+                diagnostics["thermal_resource_state"]["resource_mode"] = "conservative"
+        except Exception:
+            pass
 
         if _orchestrator_mod:
             try:

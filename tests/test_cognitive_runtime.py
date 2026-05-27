@@ -57,6 +57,22 @@ def make_client():
     return TestClient(app), manager
 
 
+class TestContextPlanning:
+    def test_estimate_inference_clamps_under_pressure(self):
+        manager = ModelManager(
+            model_map={"demo-model": "/tmp/demo.gguf"},
+            default_model="demo-model",
+        )
+        large = "x" * 120_000
+        plan = manager.estimate_inference(
+            messages=[{"role": "user", "content": large}],
+            max_tokens=4096,
+        )
+        assert plan["effective_max_tokens"] < 4096
+        assert plan["messages_truncated"]
+        assert plan["prompt_tokens_estimate"] > 0
+
+
 # ── event_bus ─────────────────────────────────────────────────────────────────
 
 
@@ -641,6 +657,8 @@ class TestCognitiveAPIEndpoints:
         data = response.json()
         assert "runtime" in data
         assert data["runtime"] == "niblit_cognitive_cloud_runtime"
+        assert "context_runtime" in data
+        assert data["context_runtime"]["context_window"] >= 4096
 
     def test_runtime_coherence_endpoint(self):
         client, _ = make_client()
@@ -745,6 +763,7 @@ class TestCognitiveAPIEndpoints:
         assert "attention_pressure" in data
         assert "governance_violations" in data
         assert "coherence_drift" in data
+        assert "context_runtime" in data
 
     def test_federation_status_endpoint(self):
         client, _ = make_client()

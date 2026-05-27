@@ -65,6 +65,21 @@ def test_chat_completions_hf_route():
     assert manager.last_chat_call["max_tokens"] == 32
 
 
+def test_chat_completions_stream_route():
+    client, _ = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "demo-model",
+            "messages": [{"role": "user", "content": "hello stream"}],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers.get("content-type", "")
+    assert "data: [DONE]" in response.text
+
+
 def test_chat_completions_compat_hf_prefix_route():
     client, _ = make_client()
     response = client.post(

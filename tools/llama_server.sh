@@ -12,7 +12,7 @@
 #   --model PATH        Path to GGUF model file (or $NIBLIT_MODEL_PATH)
 #   --port PORT         Port to bind (default: 8000 or $NIBLIT_PORT)
 #   --host HOST         Host to bind (default: 127.0.0.1)
-#   --n-ctx N           Context size (default: 2048 or $NIBLIT_N_CTX)
+#   --n-ctx N           Context size (default: 16384 or $NIBLIT_N_CTX)
 #   --n-threads N       Thread count (default: 4 or $NIBLIT_N_THREADS)
 #   --n-gpu-layers N    GPU layers (default: 0 or $NIBLIT_N_GPU_LAYERS)
 #   --backend CMD       Backend binary (default: llama-server)
@@ -49,9 +49,12 @@ _GOVERNANCE_LOG="${_TMPDIR}/niblit_cloud_reflection.jsonl"
 PORT="${NIBLIT_PORT:-8000}"
 HOST="${NIBLIT_HOST:-127.0.0.1}"
 MODEL_PATH="${NIBLIT_MODEL_PATH:-}"
-N_CTX="${NIBLIT_N_CTX:-2048}"
+N_CTX="${NIBLIT_N_CTX:-16384}"
 N_THREADS="${NIBLIT_N_THREADS:-4}"
 N_GPU_LAYERS="${NIBLIT_N_GPU_LAYERS:-0}"
+N_BATCH="${NIBLIT_N_BATCH:-1024}"
+N_UBATCH="${NIBLIT_N_UBATCH:-512}"
+ROPE_SCALE="${NIBLIT_ROPE_SCALE:-1}"
 BACKEND_BIN="${NIBLIT_LLAMA_SERVER_BIN:-llama-server}"
 TUNNEL_PROVIDER="${NIBLIT_TUNNEL_PROVIDER:-none}"
 PUBLIC_URL_OVERRIDE="${NIBLIT_TUNNEL_PUBLIC_URL:-}"
@@ -203,6 +206,9 @@ _parse_args() {
       --n-ctx)      N_CTX="$2"; shift 2 ;;
       --n-threads)  N_THREADS="$2"; shift 2 ;;
       --n-gpu-layers) N_GPU_LAYERS="$2"; shift 2 ;;
+      --n-batch)    N_BATCH="$2"; shift 2 ;;
+      --n-ubatch)   N_UBATCH="$2"; shift 2 ;;
+      --rope-scale) ROPE_SCALE="$2"; shift 2 ;;
       --backend)    BACKEND_BIN="$2"; shift 2 ;;
       --tunnel)     TUNNEL_PROVIDER="$2"; shift 2 ;;
       --public-url) PUBLIC_URL_OVERRIDE="$2"; shift 2 ;;
@@ -236,6 +242,9 @@ _load_profile() {
   N_CTX="${NIBLIT_N_CTX:-$N_CTX}"
   N_THREADS="${NIBLIT_N_THREADS:-$N_THREADS}"
   N_GPU_LAYERS="${NIBLIT_N_GPU_LAYERS:-$N_GPU_LAYERS}"
+  N_BATCH="${NIBLIT_N_BATCH:-$N_BATCH}"
+  N_UBATCH="${NIBLIT_N_UBATCH:-$N_UBATCH}"
+  ROPE_SCALE="${NIBLIT_ROPE_SCALE:-$ROPE_SCALE}"
   BACKEND_BIN="${NIBLIT_LLAMA_SERVER_BIN:-$BACKEND_BIN}"
   TUNNEL_PROVIDER="${NIBLIT_TUNNEL_PROVIDER:-$TUNNEL_PROVIDER}"
   PUBLIC_URL_OVERRIDE="${NIBLIT_TUNNEL_PUBLIC_URL:-$PUBLIC_URL_OVERRIDE}"
@@ -283,6 +292,9 @@ _print_config() {
 [niblit-llama]  n_ctx:      $N_CTX
 [niblit-llama]  n_threads:  $N_THREADS
 [niblit-llama]  n_gpu:      $N_GPU_LAYERS
+[niblit-llama]  n_batch:    $N_BATCH
+[niblit-llama]  n_ubatch:   $N_UBATCH
+[niblit-llama]  rope_scale: $ROPE_SCALE
 [niblit-llama]  tunnel:     $TUNNEL_PROVIDER
 [niblit-llama]  governance: $([ "$GOVERNANCE_ENABLED" -eq 1 ] && echo enabled || echo disabled)
 [niblit-llama]  log:        $_LOG_FILE
@@ -294,14 +306,27 @@ EOF
 
 _start_server() {
   echo "[niblit-llama] starting $BACKEND_BIN..."
-  nohup "$BACKEND_BIN" \
-    --host "$HOST" \
-    --port "$PORT" \
-    --model "$MODEL_PATH" \
-    --ctx-size "$N_CTX" \
-    --threads "$N_THREADS" \
-    --n-gpu-layers "$N_GPU_LAYERS" \
-    >>"$_LOG_FILE" 2>&1 &
+  local -a cmd=(
+    "$BACKEND_BIN"
+    --host "$HOST"
+    --port "$PORT"
+    --model "$MODEL_PATH"
+    --ctx-size "$N_CTX"
+    --threads "$N_THREADS"
+    --n-gpu-layers "$N_GPU_LAYERS"
+  )
+  local -a extra_flags=()
+  if [[ -n "$N_BATCH" ]]; then
+    extra_flags+=(--batch-size "$N_BATCH")
+  fi
+  if [[ -n "$N_UBATCH" ]]; then
+    extra_flags+=(--ubatch-size "$N_UBATCH")
+  fi
+  if [[ -n "$ROPE_SCALE" && "$ROPE_SCALE" != "1" ]]; then
+    extra_flags+=(--rope-scale "$ROPE_SCALE")
+  fi
+  cmd+=("${extra_flags[@]}")
+  nohup "${cmd[@]}" >>"$_LOG_FILE" 2>&1 &
   echo $! > "$_PID_FILE"
   echo "[niblit-llama] llama-server started (pid=$(cat "$_PID_FILE"))"
 }
