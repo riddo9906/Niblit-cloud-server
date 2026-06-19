@@ -16,7 +16,7 @@ _LOG_FILE="${_TMPDIR}/niblit-llama-server.log"
 _GOVERNANCE_LOG="${_TMPDIR}/niblit_cloud_reflection.jsonl"
 
 # ─────────────────────────────────────────────
-# Default Windows paths (your setup)
+# Default Windows paths
 # ─────────────────────────────────────────────
 
 DEFAULT_MODEL="C:/Users/Riyaad/llama_migration/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
@@ -46,6 +46,28 @@ DRY_RUN=0
 READINESS_TIMEOUT=90
 
 # ─────────────────────────────────────────────
+# PATH FIX (IMPORTANT)
+# ─────────────────────────────────────────────
+
+_normalize_path() {
+  local path="$1"
+
+  # remove accidental brace / corruption artifacts
+  path="${path//\}/}"
+  path="${path%%\}*}"
+
+  # Windows → Git Bash conversion
+  if [[ "$path" =~ ^[A-Za-z]:\\ ]]; then
+    local drive="${path:0:1}"
+    local rest="${path:2}"
+    rest="${rest//\\//}"
+    path="/${drive,,}/${rest}"
+  fi
+
+  echo "$path"
+}
+
+# ─────────────────────────────────────────────
 # Model resolution
 # ─────────────────────────────────────────────
 
@@ -55,19 +77,14 @@ _find_model_in_dir() {
   find "$dir" -maxdepth 1 -type f -name "*.gguf" | head -n 1
 }
 
-_expand_path() {
-  local v="$1"
-  v="${v//\${HOME}/$HOME}"
-  v="${v//\$HOME/$HOME}"
-  printf "%s\n" "$v"
-}
-
 _resolve_model() {
-  MODEL_PATH="$(_expand_path "$MODEL_PATH")"
+  MODEL_PATH="$(_normalize_path "$MODEL_PATH")"
 
   if [[ -d "$MODEL_PATH" ]]; then
     MODEL_PATH="$(_find_model_in_dir "$MODEL_PATH")"
   fi
+
+  MODEL_PATH="$(_normalize_path "$MODEL_PATH")"
 
   if [[ ! -f "$MODEL_PATH" ]]; then
     echo "[niblit] ERROR: model not found: $MODEL_PATH"
@@ -76,7 +93,7 @@ _resolve_model() {
 }
 
 _resolve_backend() {
-  BACKEND_BIN="$(_expand_path "$BACKEND_BIN")"
+  BACKEND_BIN="$(_normalize_path "$BACKEND_BIN")"
 
   if [[ ! -f "$BACKEND_BIN" ]]; then
     echo "[niblit] ERROR: backend not found: $BACKEND_BIN"
@@ -135,7 +152,7 @@ _emit() {
 }
 
 # ─────────────────────────────────────────────
-# Server start (OpenAI /v1 compatible)
+# Server start
 # ─────────────────────────────────────────────
 
 _start_server() {
@@ -148,14 +165,10 @@ _start_server() {
     --port "$PORT"
     -t "$N_THREADS"
     -c "$N_CTX"
-
-    # important stability defaults
     --n-predict 1024
     --cont-batching
     --batch-size 128
     --ubatch-size 64
-
-    # generation defaults
     --temp 0.7
     --repeat-penalty 1.1
   )
@@ -185,7 +198,7 @@ _start_server() {
 }
 
 # ─────────────────────────────────────────────
-# Readiness probe (/v1 compatible check)
+# Readiness probe
 # ─────────────────────────────────────────────
 
 _probe() {
@@ -201,11 +214,11 @@ _probe() {
     sleep 2
   done
 
-  echo "[niblit] warning: readiness timeout (server still may be loading)"
+  echo "[niblit] warning: readiness timeout"
 }
 
 # ─────────────────────────────────────────────
-# Tunnel (optional)
+# Tunnel
 # ─────────────────────────────────────────────
 
 _start_tunnel() {
