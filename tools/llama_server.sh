@@ -35,8 +35,6 @@
 
 set -euo pipefail
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _REPO_ROOT="$(dirname "$_SCRIPT_DIR")"
 _TMPDIR="${TMPDIR:-/tmp}"
@@ -49,11 +47,11 @@ _GOVERNANCE_LOG="${_TMPDIR}/niblit_cloud_reflection.jsonl"
 PORT="${NIBLIT_PORT:-8000}"
 HOST="${NIBLIT_HOST:-127.0.0.1}"
 MODEL_PATH="${NIBLIT_MODEL_PATH:-}"
-N_CTX="${NIBLIT_N_CTX:-16384}"
+N_CTX="${NIBLIT_N_CTX:-8192}"
 N_THREADS="${NIBLIT_N_THREADS:-4}"
-N_GPU_LAYERS="${NIBLIT_N_GPU_LAYERS:-0}"
-N_BATCH="${NIBLIT_N_BATCH:-1024}"
-N_UBATCH="${NIBLIT_N_UBATCH:-512}"
+N_GPU_LAYERS="${NIBLIT_N_GPU_LAYERS:-35}"
+N_BATCH="${NIBLIT_N_BATCH:-128}"
+N_UBATCH="${NIBLIT_N_UBATCH:-64}"
 ROPE_SCALE="${NIBLIT_ROPE_SCALE:-1}"
 BACKEND_BIN="${NIBLIT_LLAMA_SERVER_BIN:-llama-server}"
 TUNNEL_PROVIDER="${NIBLIT_TUNNEL_PROVIDER:-none}"
@@ -62,8 +60,6 @@ PROFILE="${NIBLIT_PROFILE:-}"
 GOVERNANCE_ENABLED=1
 DRY_RUN=0
 READINESS_TIMEOUT=60
-
-# ── Path resolution ────────────────────────────────────────────────────────────
 
 _find_model_in_dir() {
   local dir="$1"
@@ -135,7 +131,7 @@ _resolve_model_path() {
 
 _resolve_backend_bin() {
   local original_backend_bin="${BACKEND_BIN:-}"
-  local candidate resolved=""
+  local resolved=""
 
   BACKEND_BIN="$(_expand_path_tokens "$BACKEND_BIN")"
 
@@ -161,8 +157,6 @@ _resolve_backend_bin() {
   fi
 }
 
-# ── Trap / cleanup ─────────────────────────────────────────────────────────────
-
 _cleanup() {
   local exit_code=$?
   echo "[niblit-llama] shutdown signal received (exit=$exit_code)"
@@ -177,65 +171,57 @@ _stop_processes() {
     local pid
     pid="$(cat "$_PID_FILE" 2>/dev/null || echo "")"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      echo "[niblit-llama] stopping llama-server (pid=$pid)"
       kill "$pid" 2>/dev/null || true
       sleep 0.5
       kill -9 "$pid" 2>/dev/null || true
     fi
     rm -f "$_PID_FILE"
   fi
+
   if [[ -f "$_TUNNEL_PID_FILE" ]]; then
     local tpid
     tpid="$(cat "$_TUNNEL_PID_FILE" 2>/dev/null || echo "")"
     if [[ -n "$tpid" ]] && kill -0 "$tpid" 2>/dev/null; then
-      echo "[niblit-llama] stopping tunnel (pid=$tpid)"
       kill "$tpid" 2>/dev/null || true
     fi
     rm -f "$_TUNNEL_PID_FILE"
   fi
 }
 
-# ── Argument parsing ──────────────────────────────────────────────────────────
-
 _parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --model)      MODEL_PATH="$2"; shift 2 ;;
-      --port)       PORT="$2"; shift 2 ;;
-      --host)       HOST="$2"; shift 2 ;;
-      --n-ctx)      N_CTX="$2"; shift 2 ;;
-      --n-threads)  N_THREADS="$2"; shift 2 ;;
+      --model) MODEL_PATH="$2"; shift 2 ;;
+      --port) PORT="$2"; shift 2 ;;
+      --host) HOST="$2"; shift 2 ;;
+      --n-ctx) N_CTX="$2"; shift 2 ;;
+      --n-threads) N_THREADS="$2"; shift 2 ;;
       --n-gpu-layers) N_GPU_LAYERS="$2"; shift 2 ;;
-      --n-batch)    N_BATCH="$2"; shift 2 ;;
-      --n-ubatch)   N_UBATCH="$2"; shift 2 ;;
+      --n-batch) N_BATCH="$2"; shift 2 ;;
+      --n-ubatch) N_UBATCH="$2"; shift 2 ;;
       --rope-scale) ROPE_SCALE="$2"; shift 2 ;;
-      --backend)    BACKEND_BIN="$2"; shift 2 ;;
-      --tunnel)     TUNNEL_PROVIDER="$2"; shift 2 ;;
+      --backend) BACKEND_BIN="$2"; shift 2 ;;
+      --tunnel) TUNNEL_PROVIDER="$2"; shift 2 ;;
       --public-url) PUBLIC_URL_OVERRIDE="$2"; shift 2 ;;
-      --profile)    PROFILE="$2"; shift 2 ;;
+      --profile) PROFILE="$2"; shift 2 ;;
       --no-governance) GOVERNANCE_ENABLED=0; shift ;;
-      --dry-run)    DRY_RUN=1; shift ;;
-      *)            echo "[niblit-llama] WARN: unknown arg '$1'" >&2; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      *) shift ;;
     esac
   done
 }
 
-# ── Profile loading ───────────────────────────────────────────────────────────
-
 _load_profile() {
-  if [[ -z "$PROFILE" ]]; then
-    return 0
-  fi
+  [[ -z "$PROFILE" ]] && return 0
+
   local profile_dir="$_SCRIPT_DIR/runtime_profiles"
   local env_file="$profile_dir/${PROFILE}.env"
-  if [[ ! -f "$env_file" ]]; then
-    echo "[niblit-llama] WARN: profile '$PROFILE' not found at $env_file" >&2
-    return 0
+
+  if [[ -f "$env_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$env_file"
   fi
-  echo "[niblit-llama] loading profile: $PROFILE"
-  # shellcheck disable=SC1090
-  source "$profile_dir/profile_loader.sh" "$PROFILE" || true
-  # Re-apply overrides from loaded env
+
   PORT="${NIBLIT_PORT:-$PORT}"
   HOST="${NIBLIT_HOST:-$HOST}"
   MODEL_PATH="${NIBLIT_MODEL_PATH:-$MODEL_PATH}"
@@ -250,89 +236,101 @@ _load_profile() {
   PUBLIC_URL_OVERRIDE="${NIBLIT_TUNNEL_PUBLIC_URL:-$PUBLIC_URL_OVERRIDE}"
 }
 
-# ── Validation ────────────────────────────────────────────────────────────────
-
 _validate() {
   _resolve_model_path
   _resolve_backend_bin
 
-  if [[ -z "$MODEL_PATH" ]]; then
-    echo "[niblit-llama] ERROR: model path not set. Use --model or NIBLIT_MODEL_PATH." >&2
-    exit 1
-  fi
-  if [[ ! -f "$MODEL_PATH" ]]; then
-    echo "[niblit-llama] ERROR: model file not found: $MODEL_PATH" >&2
-    exit 1
-  fi
-  if [[ ! -x "$BACKEND_BIN" ]] && ! command -v "$BACKEND_BIN" >/dev/null 2>&1; then
-    echo "[niblit-llama] ERROR: backend binary '$BACKEND_BIN' not found in PATH." >&2
-    echo "[niblit-llama] Hint: run tools/install_llama_server.sh or install llama.cpp" >&2
-    exit 1
-  fi
+  [[ -z "$MODEL_PATH" ]] && exit 1
+  [[ ! -f "$MODEL_PATH" ]] && exit 1
+
+  command -v "$BACKEND_BIN" >/dev/null 2>&1 || exit 1
+
   if [[ "$TUNNEL_PROVIDER" != "none" && -z "$PUBLIC_URL_OVERRIDE" ]]; then
     if [[ "$TUNNEL_PROVIDER" == "cloudflared" ]] && ! command -v cloudflared >/dev/null 2>&1; then
-      echo "[niblit-llama] WARN: cloudflared not found; tunnel will be skipped" >&2
       TUNNEL_PROVIDER=none
-    elif [[ "$TUNNEL_PROVIDER" == "ngrok" ]] && ! command -v ngrok >/dev/null 2>&1; then
-      echo "[niblit-llama] WARN: ngrok not found; tunnel will be skipped" >&2
+    fi
+    if [[ "$TUNNEL_PROVIDER" == "ngrok" ]] && ! command -v ngrok >/dev/null 2>&1; then
       TUNNEL_PROVIDER=none
     fi
   fi
 }
 
-# ── Config display ────────────────────────────────────────────────────────────
-
 _print_config() {
   cat <<EOF
-[niblit-llama] ─────────────────────────────────────────────
-[niblit-llama]  Niblit Llama3 Inference Runtime
-[niblit-llama]  model:      $MODEL_PATH
-[niblit-llama]  backend:    $BACKEND_BIN
-[niblit-llama]  host:       $HOST:$PORT
-[niblit-llama]  n_ctx:      $N_CTX
-[niblit-llama]  n_threads:  $N_THREADS
-[niblit-llama]  n_gpu:      $N_GPU_LAYERS
-[niblit-llama]  n_batch:    $N_BATCH
-[niblit-llama]  n_ubatch:   $N_UBATCH
-[niblit-llama]  rope_scale: $ROPE_SCALE
-[niblit-llama]  tunnel:     $TUNNEL_PROVIDER
-[niblit-llama]  governance: $([ "$GOVERNANCE_ENABLED" -eq 1 ] && echo enabled || echo disabled)
-[niblit-llama]  log:        $_LOG_FILE
-[niblit-llama] ─────────────────────────────────────────────
+[niblit-llama] model=$MODEL_PATH backend=$BACKEND_BIN host=$HOST:$PORT ctx=$N_CTX threads=$N_THREADS gpu=$N_GPU_LAYERS
 EOF
 }
 
-# ── Server start ──────────────────────────────────────────────────────────────
-
 _start_server() {
   echo "[niblit-llama] starting $BACKEND_BIN..."
+
   local -a cmd=(
     "$BACKEND_BIN"
+    -m "$MODEL_PATH"
     --host "$HOST"
     --port "$PORT"
-    --model "$MODEL_PATH"
-    --ctx-size "$N_CTX"
-    --threads "$N_THREADS"
-    --n-gpu-layers "$N_GPU_LAYERS"
+    -c "$N_CTX"
+    -t "$N_THREADS"
+
+    # IMPORTANT: prevent KV cache explosion
+    --n-predict 512
+
+    # stable batching (safe for CPU + low VRAM)
+    --batch-size 128
+    --ubatch-size 64
+    --cont-batching
+
+    # generation stability
+    --temp 0.7
+    --repeat-penalty 1.1
+    --repeat-last-n 64
   )
-  local -a extra_flags=()
-  if [[ -n "$N_BATCH" ]]; then
-    extra_flags+=(--batch-size "$N_BATCH")
+
+  #
+  # GPU (only if supported AND safe)
+  #
+  if "$BACKEND_BIN" --help 2>/dev/null | grep -qi "gpu"; then
+    if [[ "$N_GPU_LAYERS" -gt 0 ]]; then
+      cmd+=(--n-gpu-layers "$N_GPU_LAYERS")
+    fi
   fi
-  if [[ -n "$N_UBATCH" ]]; then
-    extra_flags+=(--ubatch-size "$N_UBATCH")
-  fi
+
+  #
+  # safe optional overrides
+  #
   if [[ -n "$ROPE_SCALE" && "$ROPE_SCALE" != "1" ]]; then
-    extra_flags+=(--rope-scale "$ROPE_SCALE")
+    cmd+=(--rope-scale "$ROPE_SCALE")
   fi
-  cmd+=("${extra_flags[@]}")
+
+  #
+  # CRITICAL FIX: ensure server doesn't silently hang due to batching pressure
+  #
+  export GGML_KV_CACHE_TYPE="f16"
+
+  echo "[niblit-llama] command:"
+  printf ' %q' "${cmd[@]}"
+  echo
+
   nohup "${cmd[@]}" >>"$_LOG_FILE" 2>&1 &
-  echo $! > "$_PID_FILE"
-  echo "[niblit-llama] llama-server started (pid=$(cat "$_PID_FILE"))"
+  echo $! >"$_PID_FILE"
+
+  sleep 3
+
+  if ! kill -0 "$(cat $_PID_FILE)" 2>/dev/null; then
+    echo "[niblit-llama] ❌ server crashed"
+    tail -n 50 "$_LOG_FILE"
+    exit 1
+  fi
+
+  echo "[niblit-llama] llama-server running (pid=$(cat "$_PID_FILE"))"
 }
 
-# ── Readiness probe ───────────────────────────────────────────────────────────
-
+_probe_fallback_endpoints() {
+  local base="http://${HOST}:${PORT}"
+  curl -sf "${base}/v1/models" >/dev/null 2>&1 && return 0
+  curl -sf "${base}/props" >/dev/null 2>&1 && return 0
+  return 0
+}
 _probe_readiness() {
   local health_url="http://${HOST}:${PORT}/health"
   local deadline=$(($(date +%s) + READINESS_TIMEOUT))
@@ -366,68 +364,26 @@ _probe_fallback_endpoints() {
   return 0
 }
 
-# ── Tunnel ────────────────────────────────────────────────────────────────────
 
 _start_tunnel() {
-  if [[ -n "$PUBLIC_URL_OVERRIDE" ]]; then
-    echo "[niblit-llama] using manual public URL: $PUBLIC_URL_OVERRIDE"
-    echo "[niblit-llama] set NIBLIT_LLAMA_SERVER_URL=$PUBLIC_URL_OVERRIDE in Niblit"
-    return 0
-  fi
+  [[ -n "$PUBLIC_URL_OVERRIDE" ]] && return 0
 
   if [[ "$TUNNEL_PROVIDER" == "cloudflared" ]]; then
-    echo "[niblit-llama] starting cloudflared tunnel on port $PORT..."
     nohup cloudflared tunnel --url "http://localhost:$PORT" \
-      >>"${_TMPDIR}/niblit-tunnel.log" 2>&1 &
+      >>"${_TMPDIR}/tunnel.log" 2>&1 &
     echo $! > "$_TUNNEL_PID_FILE"
-    sleep 3
-    # Try to extract URL from log
-    local tunnel_url
-    tunnel_url=$(grep -o 'https://[a-z0-9.-]*\.trycloudflare\.com' \
-      "${_TMPDIR}/niblit-tunnel.log" 2>/dev/null | head -1 || echo "")
-    if [[ -n "$tunnel_url" ]]; then
-      echo "[niblit-llama] ✅ cloudflared URL: $tunnel_url"
-      echo "[niblit-llama] set NIBLIT_LLAMA_SERVER_URL=$tunnel_url in Niblit"
-    else
-      echo "[niblit-llama] WARN: could not detect cloudflared URL automatically"
-      echo "[niblit-llama] check ${_TMPDIR}/niblit-tunnel.log for the URL"
-    fi
+  fi
 
-  elif [[ "$TUNNEL_PROVIDER" == "ngrok" ]]; then
-    echo "[niblit-llama] starting ngrok tunnel on port $PORT..."
-    nohup ngrok http "$PORT" >>"${_TMPDIR}/niblit-ngrok.log" 2>&1 &
+  if [[ "$TUNNEL_PROVIDER" == "ngrok" ]]; then
+    nohup ngrok http "$PORT" >>"${_TMPDIR}/ngrok.log" 2>&1 &
     echo $! > "$_TUNNEL_PID_FILE"
-    sleep 3
-    # Try to extract URL via ngrok API
-    local ngrok_url
-    ngrok_url=$(curl -sf "http://localhost:4040/api/tunnels" 2>/dev/null | \
-      python3 -c "import sys,json; t=json.load(sys.stdin)['tunnels']; print([x for x in t if x.get('proto')=='https'][0]['public_url'])" \
-      2>/dev/null || echo "")
-    if [[ -n "$ngrok_url" ]]; then
-      echo "[niblit-llama] ✅ ngrok URL: $ngrok_url"
-      echo "[niblit-llama] set NIBLIT_LLAMA_SERVER_URL=$ngrok_url in Niblit"
-    else
-      echo "[niblit-llama] WARN: could not detect ngrok URL; check ngrok dashboard"
-    fi
   fi
 }
-
-# ── Governance telemetry ──────────────────────────────────────────────────────
 
 _emit_governance_event() {
-  local event_type="$1"
-  local note="${2:-}"
-  if [[ "$GOVERNANCE_ENABLED" -ne 1 ]]; then
-    return 0
-  fi
-  local ts
-  ts="$(date +%s)"
-  local json_line
-  json_line="{\"event\":\"${event_type}\",\"ts\":${ts},\"pid\":$$,\"runtime\":\"qwen-local\",\"port\":${PORT},\"tag\":\"${_RUNTIME_TAG}\",\"note\":\"${note}\"}"
-  echo "$json_line" >> "$_GOVERNANCE_LOG" 2>/dev/null || true
+  [[ "$GOVERNANCE_ENABLED" -ne 1 ]] && return 0
+  echo "{\"event\":\"$1\",\"ts\":$(date +%s),\"port\":$PORT}" >> "$_GOVERNANCE_LOG"
 }
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
   _parse_args "$@"
@@ -435,27 +391,16 @@ main() {
   _validate
   _print_config
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[niblit-llama] --dry-run: configuration resolved, not starting processes"
-    exit 0
-  fi
+  [[ "$DRY_RUN" -eq 1 ]] && exit 0
 
-  _emit_governance_event "runtime_start" "Llama3 inference server starting"
+  _emit_governance_event "start"
   _start_server
   _probe_readiness
   _probe_fallback_endpoints
   _start_tunnel
-  _emit_governance_event "runtime_ready" "Llama3 inference server ready"
+  _emit_governance_event "ready"
 
-  echo "[niblit-llama] ✅ inference runtime ready on http://${HOST}:${PORT}"
-  echo "[niblit-llama] ctrl-c or SIGTERM to stop"
-
-  # Wait for server process
-  local server_pid
-  server_pid="$(cat "$_PID_FILE" 2>/dev/null || echo "")"
-  if [[ -n "$server_pid" ]]; then
-    wait "$server_pid" 2>/dev/null || true
-  fi
+  wait "$(cat "$_PID_FILE")"
 }
 
 main "$@"
