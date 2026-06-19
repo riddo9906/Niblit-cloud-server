@@ -8,7 +8,7 @@ set -euo pipefail
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 🔥 FIXED: your actual working llama.cpp build path
-_LLAMA_CLI_DEFAULT="C:/Users/Riyaad/llama_migration/llama.cpp/llama.cpp/build/bin/Release/llama-cli.exe"
+_LLAMA_CLI_DEFAULT="C:/Users/Riyaad/llama_migration/llama.cpp/build/bin/Release/llama-server.exe"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
