@@ -45,12 +45,12 @@ EOF
 }
 
 _validate() {
-  if [[ ! -f "$MODEL_PATH" ]]; then
+  if [[ ! -e "$MODEL_PATH" ]]; then
     echo "[niblit-coder] ERROR: model not found: $MODEL_PATH" >&2
     exit 1
   fi
 
-  if [[ ! -f "$LLAMA_CLI" ]]; then
+  if [[ ! -e "$LLAMA_CLI" ]]; then
     echo "[niblit-coder] ERROR: llama-cli not found: $LLAMA_CLI" >&2
     exit 1
   fi
