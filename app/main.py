@@ -1258,6 +1258,71 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
         return diagnostics
 
+    @app.post("/v1/bridge/inference")
+    async def bridge_inference(request: Request) -> dict[str, Any]:
+        """Accept a shared Niblit message contract and return a completed inference envelope."""
+        manager: ModelManager = app.state.model_manager
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+        message_type = str(payload.get("message_type", "")).strip()
+        source = str(payload.get("source", "unknown")).strip()
+        target = str(payload.get("target", "unknown")).strip()
+        schema_version = str(payload.get("schema_version", "1.0")).strip() or "1.0"
+        correlation_id = payload.get("correlation_id")
+        message_payload = payload.get("payload", {})
+        if not isinstance(message_payload, dict):
+            raise HTTPException(status_code=400, detail="payload must be an object")
+
+        prompt = str(message_payload.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="payload.prompt is required")
+
+        model_id = str(message_payload.get("model_id") or manager.get_active_model_id() or "").strip()
+        resolved_model = model_id
+        response_text = f"Bridge response: {prompt}"
+        finish_reason = "fallback"
+        usage: dict[str, int] | None = None
+
+        if model_id:
+            try:
+                resolved_model = manager.resolve_model_id(request_model=model_id, path_model=None)
+                result = manager.chat(
+                    model_id=resolved_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=_DEFAULT_TEMPERATURE,
+                    max_tokens=_DEFAULT_MAX_TOKENS,
+                )
+                response_text = f"Bridge response: {result.text}"
+                finish_reason = result.finish_reason
+                usage = result.usage
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                response_text = f"Bridge response: {prompt}"
+                finish_reason = "fallback"
+                usage = {"prompt_tokens": len(prompt.split()), "completion_tokens": 0, "total_tokens": len(prompt.split())}
+        else:
+            response_text = f"Bridge response: {prompt}"
+            usage = {"prompt_tokens": len(prompt.split()), "completion_tokens": 0, "total_tokens": len(prompt.split())}
+
+        return {
+            "message_type": "ai.inference.completed",
+            "source": "niblit-cloud-server",
+            "target": target or source or "niblit",
+            "schema_version": schema_version,
+            "correlation_id": correlation_id,
+            "payload": {
+                "model_id": resolved_model or model_id,
+                "response_text": response_text,
+                "finish_reason": finish_reason,
+                "usage": usage,
+                "request_source": source,
+                "request_message_type": message_type,
+            },
+        }
+
     # ── Metrics endpoints ──────────────────────────────────────────────────────
 
     @app.get("/metrics/cognitive")
