@@ -70,6 +70,7 @@ def _load_models_from_env() -> dict[str, str]:
     raw = os.getenv("GGUF_MODELS_JSON", "{}").strip()
     if not raw:
         return {}
+
     try:
         loaded = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -77,6 +78,20 @@ def _load_models_from_env() -> dict[str, str]:
     if not isinstance(loaded, dict):
         raise RuntimeError("GGUF_MODELS_JSON must be a JSON object")
     return {str(k): str(v) for k, v in loaded.items()}
+
+
+def _build_default_model_map() -> tuple[dict[str, str], str | None]:
+    models = _load_models_from_env()
+    default_model = os.getenv("DEFAULT_MODEL_ID")
+
+    fallback_path = os.getenv("NIBLIT_DEFAULT_MODEL_PATH") or os.getenv("NIBLIT_MODEL_PATH")
+    if not models and fallback_path:
+        model_id = os.getenv("NIBLIT_DEFAULT_MODEL_ID", "fallback")
+        models = {model_id: fallback_path}
+        if not default_model:
+            default_model = model_id
+
+    return models, default_model
 
 
 @dataclass
@@ -501,8 +516,7 @@ def _build_chat_response(model_id: str, result: ModelEngineResult) -> dict[str, 
 
 
 def create_app(model_manager: ModelManager | None = None) -> FastAPI:
-    models = _load_models_from_env()
-    default_model = os.getenv("DEFAULT_MODEL_ID")
+    models, default_model = _build_default_model_map()
     _manager = model_manager or ModelManager(models, default_model)
 
     # ── Boot cognitive runtime subsystems ─────────────────────────────────────

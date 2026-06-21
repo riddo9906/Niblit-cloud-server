@@ -285,7 +285,8 @@ class SidecarClient:
             attempts.append(("unix", self._unix_request))
         if self._cfg.tcp_host and self._cfg.tcp_port > 0:
             attempts.append(("tcp", self._tcp_request))
-        attempts.append(("http", self._http_request))
+        if not attempts:
+            attempts.append(("http", self._http_request))
 
         payload = dict(body or {}) if body else None
         if payload is not None:
@@ -334,6 +335,9 @@ class SidecarClient:
 
     def _unix_request(self, method: str, path: str, body: dict[str, Any] | None) -> SidecarResponse:
         url = f"unix:{self._cfg.unix_socket}{path}"
+        if not hasattr(socket, "AF_UNIX"):
+            return SidecarResponse(ok=False, status_code=0, data={}, error="unix sockets unsupported on this platform", url=url)
+
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(self._cfg.timeout)
         try:

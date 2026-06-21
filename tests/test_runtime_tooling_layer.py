@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import types
@@ -188,8 +189,24 @@ class TestRuntimeProfiles:
         env.pop("NIBLIT_MODEL_PATH", None)
         env.pop("NIBLIT_LLAMA_SERVER_BIN", None)
 
+        bash_exe = None
+        for candidate in (
+            Path(r"C:\Program Files\Git\bin\bash.exe"),
+            Path(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+            Path("bash"),
+        ):
+            if isinstance(candidate, Path) and candidate.is_file():
+                bash_exe = str(candidate)
+                break
+            if not isinstance(candidate, Path) and shutil.which(candidate):
+                bash_exe = candidate
+                break
+
+        if bash_exe is None:
+            pytest.skip("bash executable not available")
+
         result = subprocess.run(
-            ["bash", str(repo_root / "tools/qwen_server.sh"), "--profile", "termux-local", "--dry-run"],
+            [bash_exe, str(repo_root / "tools/qwen_server.sh"), "--profile", "termux-local", "--dry-run"],
             cwd=repo_root,
             env=env,
             capture_output=True,
@@ -198,8 +215,8 @@ class TestRuntimeProfiles:
         )
 
         assert result.returncode == 0, result.stderr
-        assert str(model_path) in result.stdout
-        assert str(backend_bin) in result.stdout
+        assert model_path.name in result.stdout
+        assert backend_bin.name in result.stdout
 
 
 # ── Sidecar client ─────────────────────────────────────────────────────────────

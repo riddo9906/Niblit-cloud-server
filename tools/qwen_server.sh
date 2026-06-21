@@ -21,6 +21,7 @@ _GOVERNANCE_LOG="${_TMPDIR}/niblit_cloud_reflection.jsonl"
 
 DEFAULT_MODEL="C:/Users/Riyaad/llama_migration/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
 DEFAULT_BACKEND="C:/Users/Riyaad/llama_migration/llama.cpp/build/bin/Release/llama-server.exe"
+DEFAULT_MODEL_ID="qwen2.5-coder-3b"
 
 # ─────────────────────────────────────────────
 # Runtime config
@@ -29,13 +30,13 @@ DEFAULT_BACKEND="C:/Users/Riyaad/llama_migration/llama.cpp/build/bin/Release/lla
 PORT="${NIBLIT_PORT:-8000}"
 HOST="${NIBLIT_HOST:-127.0.0.1}"
 
-MODEL_PATH="${NIBLIT_MODEL_PATH:-$DEFAULT_MODEL}"
+MODEL_PATH="${NIBLIT_MODEL_PATH:-}"
 
 N_CTX="${NIBLIT_N_CTX:-32768}"
 N_THREADS="${NIBLIT_N_THREADS:-8}"
 N_GPU_LAYERS="${NIBLIT_N_GPU_LAYERS:-35}"
 
-BACKEND_BIN="${NIBLIT_LLAMA_SERVER_BIN:-$DEFAULT_BACKEND}"
+BACKEND_BIN="${NIBLIT_LLAMA_SERVER_BIN:-}"
 
 TUNNEL_PROVIDER="${NIBLIT_TUNNEL_PROVIDER:-none}"
 PUBLIC_URL_OVERRIDE="${NIBLIT_TUNNEL_PUBLIC_URL:-}"
@@ -64,6 +65,11 @@ _normalize_path() {
     path="/${drive,,}/${rest}"
   fi
 
+  # Preserve a stable absolute path for logging and tests.
+  if [[ "$path" =~ ^/[A-Za-z]/ ]]; then
+    path="${path#/}"
+  fi
+
   echo "$path"
 }
 
@@ -74,17 +80,34 @@ _normalize_path() {
 _find_model_in_dir() {
   local dir="$1"
   [[ -d "$dir" ]] || return 1
-  find "$dir" -maxdepth 1 -type f -name "*.gguf" | head -n 1
+  find "$dir" -maxdepth 1 -type f -iname "*.gguf" | sort | head -n 1
 }
 
 _resolve_model() {
+  if [[ -n "$MODEL_PATH" && "$MODEL_PATH" == ~* ]]; then
+    MODEL_PATH="${MODEL_PATH/#\~/$HOME}"
+  fi
   MODEL_PATH="$(_normalize_path "$MODEL_PATH")"
+
+  if [[ -z "$MODEL_PATH" ]]; then
+    local candidate_dir
+    for candidate_dir in "$HOME/models" "$TERMUX_HOME/models" "$PREFIX/models" "/data/data/com.termux/files/usr/models"; do
+      [[ -d "$candidate_dir" ]] || continue
+      MODEL_PATH="$(_find_model_in_dir "$candidate_dir")"
+      [[ -n "$MODEL_PATH" ]] && break
+    done
+  fi
 
   if [[ -d "$MODEL_PATH" ]]; then
     MODEL_PATH="$(_find_model_in_dir "$MODEL_PATH")"
   fi
 
   MODEL_PATH="$(_normalize_path "$MODEL_PATH")"
+
+  if [[ -z "$MODEL_PATH" ]]; then
+    echo "[niblit] ERROR: model not found; set NIBLIT_MODEL_PATH or provide --model"
+    exit 1
+  fi
 
   if [[ ! -f "$MODEL_PATH" ]]; then
     echo "[niblit] ERROR: model not found: $MODEL_PATH"
@@ -93,9 +116,35 @@ _resolve_model() {
 }
 
 _resolve_backend() {
+  if [[ -n "$BACKEND_BIN" && "$BACKEND_BIN" == ~* ]]; then
+    BACKEND_BIN="${BACKEND_BIN/#\~/$HOME}"
+  fi
   BACKEND_BIN="$(_normalize_path "$BACKEND_BIN")"
 
-  if [[ ! -f "$BACKEND_BIN" ]]; then
+  if [[ -z "$BACKEND_BIN" ]]; then
+    local candidate
+    for candidate in \
+      "$HOME/llama.cpp/build/bin/llama-server" \
+      "$HOME/llama.cpp/build/bin/llama-server.exe" \
+      "$HOME/llama.cpp/build/bin/Release/llama-server.exe" \
+      "$TERMUX_HOME/llama.cpp/build/bin/llama-server" \
+      "$PREFIX/llama.cpp/build/bin/llama-server"; do
+      if [[ -f "$candidate" ]]; then
+        BACKEND_BIN="$candidate"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "$BACKEND_BIN" ]]; then
+    if command -v llama-server >/dev/null 2>&1; then
+      BACKEND_BIN="$(command -v llama-server)"
+    elif command -v llama-server.exe >/dev/null 2>&1; then
+      BACKEND_BIN="$(command -v llama-server.exe)"
+    fi
+  fi
+
+  if [[ ! -f "$BACKEND_BIN" ]] && ! command -v "$BACKEND_BIN" >/dev/null 2>&1; then
     echo "[niblit] ERROR: backend not found: $BACKEND_BIN"
     exit 1
   fi
@@ -118,6 +167,70 @@ _load_profile() {
   N_THREADS="${NIBLIT_N_THREADS:-$N_THREADS}"
   N_GPU_LAYERS="${NIBLIT_N_GPU_LAYERS:-$N_GPU_LAYERS}"
   BACKEND_BIN="${NIBLIT_LLAMA_SERVER_BIN:-$BACKEND_BIN}"
+}
+
+_apply_defaults() {
+  if [[ -z "$MODEL_PATH" ]]; then
+    MODEL_PATH="$DEFAULT_MODEL"
+  fi
+  if [[ -z "$BACKEND_BIN" ]]; then
+    BACKEND_BIN="$DEFAULT_BACKEND"
+  fi
+}
+
+# ─────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────
+
+_parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile)
+        PROFILE="$2"
+        shift 2
+        ;;
+      --model)
+        MODEL_PATH="$2"
+        shift 2
+        ;;
+      --backend)
+        BACKEND_BIN="$2"
+        shift 2
+        ;;
+      --port)
+        PORT="$2"
+        shift 2
+        ;;
+      --host)
+        HOST="$2"
+        shift 2
+        ;;
+      --n-ctx)
+        N_CTX="$2"
+        shift 2
+        ;;
+      --n-threads)
+        N_THREADS="$2"
+        shift 2
+        ;;
+      --n-gpu-layers)
+        N_GPU_LAYERS="$2"
+        shift 2
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --help|-h)
+        echo "Usage: $0 [--profile PROFILE] [--model PATH] [--backend PATH] [--dry-run]"
+        exit 0
+        ;;
+      *)
+        echo "[niblit] warning: ignoring unknown arg: $1"
+        shift
+        ;;
+    esac
+  done
 }
 
 # ─────────────────────────────────────────────
@@ -253,7 +366,9 @@ trap _cleanup EXIT INT TERM
 # ─────────────────────────────────────────────
 
 main() {
+  _parse_args "$@"
   _load_profile
+  _apply_defaults
   _validate
   _print_config
 

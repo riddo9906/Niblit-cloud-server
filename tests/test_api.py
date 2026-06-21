@@ -34,6 +34,22 @@ def make_client() -> tuple[TestClient, FakeModelManager]:
     return TestClient(app), manager
 
 
+def test_create_app_uses_configured_fallback_model_path(monkeypatch, tmp_path):
+    model_path = tmp_path / "fallback.gguf"
+    model_path.write_bytes(b"GGUF")
+
+    monkeypatch.delenv("GGUF_MODELS_JSON", raising=False)
+    monkeypatch.delenv("DEFAULT_MODEL_ID", raising=False)
+    monkeypatch.setenv("NIBLIT_DEFAULT_MODEL_PATH", str(model_path))
+
+    app = create_app()
+    manager = app.state.model_manager
+
+    info = manager.get_default_model_info()
+    assert info["model_id"] == "fallback"
+    assert info["model_path"] == str(model_path)
+
+
 def test_models_list():
     client, _ = make_client()
     response = client.get("/v1/models")

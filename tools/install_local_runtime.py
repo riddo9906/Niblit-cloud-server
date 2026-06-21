@@ -95,10 +95,13 @@ def detect_platform() -> dict[str, Any]:
         is_termux = False
     else:
         is_termux = (
-            bool(os.environ.get("TERMUX_VERSION"))
-            or "com.termux" in os.environ.get("PREFIX", "")
-            or "/data/data/com.termux" in os.environ.get("HOME", "")
-            or Path("/data/data/com.termux").exists()
+            (uname.system == "Linux")
+            and (
+                bool(os.environ.get("TERMUX_VERSION"))
+                or "com.termux" in os.environ.get("PREFIX", "")
+                or "/data/data/com.termux" in os.environ.get("HOME", "")
+                or Path("/data/data/com.termux").exists()
+            )
         )
 
     is_container = _is_container
