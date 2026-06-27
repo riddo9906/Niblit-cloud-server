@@ -9,8 +9,10 @@ from dataclasses import dataclass
 from typing import Any, Generator
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+from app.cursor_gateway import _detail_to_message, get_cursor_gateway, openai_error_body
 
 logger = logging.getLogger(__name__)
 
@@ -436,6 +438,7 @@ class ChatCompletionRequest(BaseModel):
     messages: list[dict[str, Any]] = Field(default_factory=list)
     temperature: float = _DEFAULT_TEMPERATURE
     max_tokens: int = _DEFAULT_MAX_TOKENS
+    max_completion_tokens: int | None = None
     stream: bool = False
     # Accepted for llama-server API compatibility; passed through to the engine.
     stop: list[str] | None = None
@@ -561,6 +564,26 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.model_manager = _manager
+    _cursor_gateway = get_cursor_gateway()
+
+    @app.exception_handler(HTTPException)
+    async def openai_http_exception_handler(request: Request, exc: HTTPException):
+        if not _cursor_gateway.enabled:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        if not request.url.path.startswith("/v1/"):
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        detail = exc.detail
+        if isinstance(detail, dict) and "message" in detail:
+            message = str(detail["message"])
+        elif isinstance(detail, str):
+            message = detail
+        else:
+            message = json.dumps(detail)
+        _cursor_gateway.log_upstream_error(status_code=exc.status_code, detail=message)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=openai_error_body(message, status_code=exc.status_code),
+        )
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
@@ -602,9 +625,14 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/v1/models")
     @app.get("/models")
-    def list_models() -> dict[str, Any]:
+    def list_models(request: Request) -> dict[str, Any]:
+        start = _cursor_gateway.log_incoming(request, path="/v1/models", model=None)
         manager: ModelManager = app.state.model_manager
-        return {"object": "list", "data": manager.list_models()}
+        payload = _cursor_gateway.adapt_models_response(
+            {"object": "list", "data": manager.list_models()}
+        )
+        _cursor_gateway.log_complete(start, status_code=200)
+        return payload
 
     @app.get("/v1/models/{model_id}")
     @app.get("/models/{model_id}/info")
@@ -845,14 +873,47 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     @app.post("/chat/completions")
     @app.post("/v1/models/{path_model}/chat/completions")
     def chat_completions(
-        payload: ChatCompletionRequest, path_model: str | None = None
+        payload: ChatCompletionRequest,
+        request: Request,
+        path_model: str | None = None,
     ) -> Any:
-        if payload.stream:
-            return StreamingResponse(
-                stream_chat_completion(payload, path_model),
-                media_type="text/event-stream",
+        manager: ModelManager = app.state.model_manager
+        available_models = [entry["id"] for entry in manager.list_models()]
+        default_model = manager.get_active_model_id()
+
+        adapted, gw_ctx = _cursor_gateway.prepare_chat(
+            payload,
+            path_model=path_model,
+            available_models=available_models,
+            default_model=default_model,
+        )
+        model = _cursor_gateway.resolve_request_model(adapted, path_model)
+        start = _cursor_gateway.log_incoming(
+            request, path="/v1/chat/completions", model=model
+        )
+        try:
+            if adapted.stream:
+                return StreamingResponse(
+                    _cursor_gateway.wrap_stream(
+                        stream_chat_completion(adapted, path_model),
+                        start=start,
+                        model=model,
+                        ctx=gw_ctx,
+                    ),
+                    media_type="text/event-stream",
+                    headers=_cursor_gateway.stream_headers,
+                )
+            response = _cursor_gateway.adapt_chat_response(handle_chat(adapted, path_model))
+            _cursor_gateway.finalize_chat(gw_ctx, response=response, status_code=200)
+            _cursor_gateway.log_complete(start, status_code=200, model=model)
+            return response
+        except HTTPException as exc:
+            _cursor_gateway.finalize_chat(
+                gw_ctx,
+                status_code=exc.status_code,
+                error=_detail_to_message(exc.detail),
             )
-        return handle_chat(payload, path_model)
+            raise
 
     @app.post("/completion")
     def legacy_completion(payload: CompletionRequest) -> dict[str, Any]:

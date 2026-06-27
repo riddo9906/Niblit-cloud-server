@@ -57,7 +57,8 @@ def test_models_list():
     payload = response.json()
     assert payload["object"] == "list"
     assert len(payload["data"]) == 1
-    assert payload["data"] == [{"id": "demo-model", "object": "model"}]
+    assert payload["data"][0]["id"] == "demo-model"
+    assert payload["data"][0]["object"] == "model"
 
 
 def test_chat_completions_hf_route():

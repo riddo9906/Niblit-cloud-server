@@ -271,3 +271,74 @@ Operational tooling in `tools/` supports remote orchestration across cloud and e
 - `cloud_runtime_ctl.py` (CLI) + `lib/runtime_client.py` (reusable API client)
 - `install_runtime.sh` portable installer with version pinning and integrity checks
 - `start_server.sh` lifecycle and smoke tooling for runtime operators
+
+## Cognitive Gateway Layer
+
+The Cognitive Gateway sits between external OpenAI-compatible clients (e.g. Cursor)
+and the existing `/v1` inference handlers. It extends the Cursor Gateway Adapter
+without modifying `ModelManager`, `GGUFEngine`, or `handle_chat()`.
+
+```
+Cursor / OpenAI client
+        │
+        ▼
+┌───────────────────────────────────────┐
+│  Cursor Gateway (app/cursor_gateway)  │
+│  OpenAI normalization + SSE headers   │
+└───────────────────┬───────────────────┘
+                    ▼
+┌───────────────────────────────────────┐
+│  Cognitive Gateway                      │
+│  (app/cognitive_gateway)                │
+│  ┌─────────────────────────────────┐  │
+│  │ Request Classifier               │  │
+│  │ coding / reasoning / memory /    │  │
+│  │ tool_usage / general_chat        │  │
+│  └──────────────┬──────────────────┘  │
+│                 ▼                      │
+│  ┌─────────────────────────────────┐  │
+│  │ Rule-based Model Router          │  │
+│  │ dynamic / passthrough / static   │  │
+│  └──────────────┬──────────────────┘  │
+│                 ▼                      │
+│  ┌─────────────────────────────────┐  │
+│  │ Hook System (structural)         │  │
+│  │ memory before/after (placeholder)│ │
+│  │ sync event bus (request-driven)  │  │
+│  └──────────────┬──────────────────┘  │
+│                 ▼                      │
+│  ┌─────────────────────────────────┐  │
+│  │ Observability                    │  │
+│  │ classification, routing, latency │  │
+│  └─────────────────────────────────┘  │
+└───────────────────┬───────────────────┘
+                    ▼
+        Existing /v1/chat/completions
+        handle_chat() → ModelManager → GGUF
+```
+
+### Request flow
+
+1. Cursor Gateway normalizes message shapes (`developer` → `system`, multimodal content).
+2. Cognitive Gateway classifies the request and assigns compute priority.
+3. Router selects a model using `ROUTING_STRATEGY` and routing rules from env/file.
+4. Memory hook `before_request()` runs (no-op unless `MEMORY_HOOK_ENABLED=1`).
+5. Existing `handle_chat()` performs inference unchanged.
+6. Response is stripped of non-OpenAI fields; memory `after_response()` and events fire.
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_COGNITIVE_GATEWAY` | `1` | Enable classification + routing layer |
+| `ROUTING_STRATEGY` | `dynamic` | `dynamic`, `passthrough`, or `static` |
+| `MEMORY_HOOK_ENABLED` | `0` | Placeholder memory injection hook |
+| `TOOL_HOOK_ENABLED` | `0` | Placeholder tool/event hook gate |
+| `COGNITIVE_GATEWAY_ROUTING_JSON` | `{}` | Request-type → model ID map |
+| `COGNITIVE_GATEWAY_FALLBACK_MODEL` | — | Fallback when rule target unavailable |
+
+### Resource safety
+
+- No background threads, polling loops, or persistent async workers.
+- Event bus handlers run synchronously per request.
+- `GatewayContext` is request-scoped only.
