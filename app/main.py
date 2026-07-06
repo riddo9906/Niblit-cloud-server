@@ -1209,6 +1209,74 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             topology["connectivity"] = "unknown"
         return topology
 
+    def _build_runtime_envelope_snapshot() -> dict[str, Any]:
+        """Build schema-v2 envelope JSON for lean-algos RuntimeAdapter (non-inference)."""
+        ts = int(time.time())
+        mode_info = runtime_mode()
+        mode = str(mode_info.get("mode", "normal"))
+        base: dict[str, Any] = {}
+        if _envelope_mod is not None:
+            try:
+                base = _envelope_mod.normalize_envelope({})
+            except Exception:
+                base = {}
+        envelope: dict[str, Any] = {
+            "schema_version": "2.x",
+            "timestamp": ts,
+            "runtime": dict(base.get("runtime") or {}),
+            "governance": dict(base.get("governance") or {}),
+            "temporal": dict(base.get("temporal") or {}),
+            "resources": dict(base.get("resources") or {}),
+            "reflection": dict(base.get("reflection") or {}),
+            "risk": dict(base.get("risk") or {}),
+        }
+        envelope["runtime"]["mode"] = mode
+        envelope["runtime"]["runtime_health"] = 0.95
+        envelope["runtime"]["attention_pressure"] = 0.15
+        envelope["runtime"]["runtime_pressure"] = 0.15
+        envelope["governance"]["governance_mode"] = mode
+        envelope["governance"]["survival_mode"] = mode in {"survival", "lockdown"}
+        envelope["governance"]["constitution_passed"] = mode != "lockdown"
+        envelope["temporal"]["epoch_id"] = ts
+        envelope["temporal"]["coherence_score"] = 0.85
+        envelope["temporal"]["coherence_drift"] = 0.0
+        envelope["resources"]["cognitive_budget"] = 1.0
+        envelope["resources"]["attention_available"] = 1.0
+
+        if _temporal_mod:
+            try:
+                temporal_status = _temporal_mod.get_temporal_sync().status()
+                if isinstance(temporal_status, dict):
+                    envelope["temporal"].update(temporal_status)
+                    envelope["temporal"]["coherence_score"] = float(
+                        temporal_status.get("coherence", envelope["temporal"]["coherence_score"])
+                    )
+            except Exception:
+                pass
+        if _governance_mod:
+            try:
+                gov_status = _governance_mod.get_cloud_governance().status()
+                if isinstance(gov_status, dict):
+                    envelope["governance"].update(gov_status)
+            except Exception:
+                pass
+        if _attention_mod:
+            try:
+                att = _attention_mod.get_attention_allocator().status()
+                if isinstance(att, dict):
+                    overload = bool(att.get("overload"))
+                    envelope["resources"]["attention_available"] = 0.25 if overload else 1.0
+                    envelope["runtime"]["attention_pressure"] = 0.85 if overload else 0.15
+            except Exception:
+                pass
+        return envelope
+
+    @app.get("/niblit/runtime")
+    @app.get("/v1/runtime/envelope")
+    def runtime_envelope_snapshot() -> dict[str, Any]:
+        """Envelope-compatible runtime snapshot for execution-node adapters."""
+        return _build_runtime_envelope_snapshot()
+
     @app.get("/v1/runtime/diagnostics")
     def runtime_diagnostics() -> dict[str, Any]:
         """Operational diagnostics for governance-aware runtime operations."""
