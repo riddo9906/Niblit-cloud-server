@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
@@ -16,47 +17,23 @@ from app.cursor_gateway import _detail_to_message, get_cursor_gateway, openai_er
 
 logger = logging.getLogger(__name__)
 
-# ── Cognitive runtime modules (best-effort imports) ───────────────────────────
-# All new modules degrade gracefully if disabled or unavailable.
-
 def _try_import(module_path: str) -> Any:
-    """Best-effort import of a cloud runtime module."""
     try:
         import importlib
         return importlib.import_module(module_path)
     except Exception:
         return None
 
-# Niblit's QwenLocalBrain._generate_http() always sends "model": "local" in
-# every request so the cloud server can act as a drop-in llama-server
-# replacement.  Any of these aliases resolves to the configured default model.
-_LOCAL_MODEL_ALIASES: frozenset[str] = frozenset({"local", "llama", "default"})
-
-# Shared defaults for request schemas.
+_LOCAL_MODEL_ALIASES: frozenset[str] = frozenset({"local", "llama", "default", "primary"})
 _DEFAULT_TEMPERATURE: float = 0.2
 _DEFAULT_MAX_TOKENS: int = 256
 _CANONICAL_MODES: tuple[str, ...] = ("normal", "cautious", "survival", "lockdown")
 _MESSAGE_OVERHEAD_CHARS: int = 8
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_float(name: str, default: float | None = None) -> float | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
+def _get_config() -> Any:
+    from app.config import get_config
+    return get_config()
 
 
 def _normalize_runtime_mode(mode: object, default: str = "normal") -> str:
@@ -68,34 +45,6 @@ def _normalize_runtime_mode(mode: object, default: str = "normal") -> str:
     return candidate
 
 
-def _load_models_from_env() -> dict[str, str]:
-    raw = os.getenv("GGUF_MODELS_JSON", "{}").strip()
-    if not raw:
-        return {}
-
-    try:
-        loaded = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("GGUF_MODELS_JSON is not valid JSON") from exc
-    if not isinstance(loaded, dict):
-        raise RuntimeError("GGUF_MODELS_JSON must be a JSON object")
-    return {str(k): str(v) for k, v in loaded.items()}
-
-
-def _build_default_model_map() -> tuple[dict[str, str], str | None]:
-    models = _load_models_from_env()
-    default_model = os.getenv("DEFAULT_MODEL_ID")
-
-    fallback_path = os.getenv("NIBLIT_DEFAULT_MODEL_PATH") or os.getenv("NIBLIT_MODEL_PATH")
-    if not models and fallback_path:
-        model_id = os.getenv("NIBLIT_DEFAULT_MODEL_ID", "fallback")
-        models = {model_id: fallback_path}
-        if not default_model:
-            default_model = model_id
-
-    return models, default_model
-
-
 @dataclass
 class ModelEngineResult:
     text: str
@@ -104,6 +53,15 @@ class ModelEngineResult:
 
 
 class GGUFEngine:
+    """GGUF inference engine with crash protection and diagnostics.
+
+    Root cause of segfault: unsupported constructor parameters (n_batch,
+    n_ubatch, rope_freq_base, rope_freq_scale) passed to Llama() in
+    llama-cpp-python 0.3.16 on Windows cause native memory corruption.
+    Additional fix: disable mmap on Windows (known segfault with GGUF),
+    validate prompt length before inference, wrap all calls in try/except.
+    """
+
     def __init__(
         self,
         model_path: str,
@@ -111,87 +69,245 @@ class GGUFEngine:
         n_threads: int,
         runtime_options: dict[str, Any] | None = None,
     ):
-        logger.info("Loading model from %s (n_ctx=%d, n_threads=%d)", model_path, n_ctx, n_threads)
+        logger.info(
+            "Loading model from %s (n_ctx=%d, n_threads=%d)",
+            model_path, n_ctx, n_threads,
+        )
         try:
             from llama_cpp import Llama
         except ImportError as exc:
             raise RuntimeError(
                 "llama-cpp-python is required to run GGUF inference."
             ) from exc
+
+        # ── Safe parameters only ──────────────────────────────────────────
+        # Avoid: n_batch, n_ubatch, rope_freq_base, rope_freq_scale
+        # (unsupported in 0.3.16, cause segfault via native memory corruption).
         kwargs: dict[str, Any] = {
             "model_path": model_path,
             "n_ctx": n_ctx,
             "n_threads": n_threads,
+            "use_mmap": False,            # Windows + mmap = segfault
+            "use_mlock": False,           # safest: no mlock
+            "seed": 42,                    # avoids undefined native state
+            "verbose": False,              # suppress excessive stderr
         }
-        for key, value in (runtime_options or {}).items():
-            if value is not None:
-                kwargs[key] = value
+        gpu_layers = os.getenv("NIBLIT_N_GPU_LAYERS", "").strip()
+        if gpu_layers:
+            try:
+                kwargs["n_gpu_layers"] = int(gpu_layers)
+            except (TypeError, ValueError):
+                pass
+
+        logger.info("Llama kwargs: %s", {k: v for k, v in kwargs.items() if k != "model_path"})
         try:
             self._llm = Llama(**kwargs)
-        except TypeError:
-            logger.warning(
-                "llama_cpp runtime options unsupported by current build; falling back to core args."
-            )
-            self._llm = Llama(model_path=model_path, n_ctx=n_ctx, n_threads=n_threads)
+        except Exception as exc:
+            logger.error("Llama init failed: %s", exc)
+            raise RuntimeError(f"Model initialization failed: {exc}") from exc
+
+        self._model_meta: dict[str, Any] = {
+            "file": model_path,
+            "n_ctx": n_ctx,
+            "n_threads": n_threads,
+        }
+        self._lock = threading.Lock()
         logger.info("Model loaded successfully from %s", model_path)
+
+    def _reload_model(self) -> None:
+        """Reload the GGUF model to recover from native state corruption.
+
+        Called when llama_decode returns -1 (GGML_ASSERT failure), which
+        indicates the native llama.cpp context has been corrupted by a
+        previous large generation. Reloading creates a fresh context.
+        """
+        model_path = self._model_meta["file"]
+        n_ctx = self._model_meta["n_ctx"]
+        n_threads = self._model_meta["n_threads"]
+        logger.info("Reloading model: %s", model_path)
+        try:
+            from llama_cpp import Llama
+        except ImportError as exc:
+            raise RuntimeError("llama-cpp-python is required.") from exc
+        kwargs: dict[str, Any] = {
+            "model_path": model_path,
+            "n_ctx": n_ctx,
+            "n_threads": n_threads,
+            "use_mmap": False,
+            "use_mlock": False,
+            "seed": 42,
+            "verbose": False,
+        }
+        gpu_layers = os.getenv("NIBLIT_N_GPU_LAYERS", "").strip()
+        if gpu_layers:
+            try:
+                kwargs["n_gpu_layers"] = int(gpu_layers)
+            except (TypeError, ValueError):
+                pass
+        with self._lock:
+            self._llm = Llama(**kwargs)
+        logger.info("Model reloaded successfully: %s", model_path)
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return dict(self._model_meta)
+
+    def _estimate_tokens_rough(self, messages: list[dict[str, str]]) -> int:
+        total = sum(len(m.get("content", "")) for m in messages)
+        return max(1, total // 4)
+
+    def validate_prompt(self, messages: list[dict[str, str]], max_tokens: int) -> None:
+        prompt_tokens = self._estimate_tokens_rough(messages)
+        available = self._model_meta.get("n_ctx", 16384)
+        reserve = 256
+        budget = available - reserve
+        if prompt_tokens > budget:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "context_overflow",
+                    "message": (
+                        f"Prompt ~{prompt_tokens} tokens exceeds "
+                        f"budget of {budget} (context={available}, reserve={reserve})."
+                    ),
+                    "prompt_tokens": prompt_tokens,
+                    "max_context": available,
+                    "budget": budget,
+                },
+            )
 
     def chat(
         self, messages: list[dict[str, str]], temperature: float, max_tokens: int
     ) -> ModelEngineResult:
-        response = self._llm.create_chat_completion(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=False,
+        self.validate_prompt(messages, max_tokens)
+
+        safe_messages: list[dict[str, str]] = []
+        for msg in messages:
+            safe_messages.append({
+                "role": str(msg.get("role", "user")).strip(),
+                "content": str(msg.get("content", " ")).strip() or " ",
+            })
+
+        logger.info(
+            "Inference: messages=%d prompt~%d max_tokens=%d temp=%.2f",
+            len(safe_messages), self._estimate_tokens_rough(safe_messages),
+            max_tokens, temperature,
         )
-        choices = response.get("choices")
-        if not isinstance(choices, list):
-            raise RuntimeError(
-                "Model returned unexpected response format: choices must be a list "
-                f"(got {type(choices).__name__})."
+
+        # llama-cpp-python 0.3.16 Llama object is NOT thread-safe.
+        # Serialize all create_chat_completion() calls to prevent
+        # concurrent native access that causes llama_decode returned -1
+        # and GGML_ASSERT failures.
+        with self._lock:
+            try:
+                response = self._llm.create_chat_completion(
+                messages=safe_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
             )
-        if not choices:
-            raise RuntimeError(
-                "Model returned unexpected response format: choices must not be empty "
-                f"(response keys: {sorted(response.keys())})."
+            except RuntimeError as exc:
+                exc_str = str(exc)
+                logger.error("llama.cpp error: %s", exc_str)
+                if "llama_decode returned" in exc_str or "GGML_ASSERT" in exc_str:
+                    logger.info("Attempting model reload after decode error...")
+                    try:
+                        self._reload_model()
+                        response = self._llm.create_chat_completion(
+                            messages=safe_messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            stream=False,
+                        )
+                    except Exception as retry_exc:
+                        logger.error("Retry after reload failed: %s", retry_exc)
+                        raise HTTPException(
+                            status_code=503,
+                            detail={"error": "inference_failed", "message": str(retry_exc)},
+                        ) from retry_exc
+                else:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"error": "inference_failed", "message": exc_str},
+                    ) from exc
+            except ValueError as exc:
+                logger.error("llama.cpp value error: %s", exc)
+                raise HTTPException(status_code=503, detail={"error": "inference_failed", "message": str(exc)}) from exc
+            except MemoryError as exc:
+                logger.error("llama.cpp OOM: %s", exc)
+                raise HTTPException(status_code=503, detail={"error": "out_of_memory", "message": str(exc)}) from exc
+
+            choices = response.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise HTTPException(status_code=502, detail={"error": "empty_response", "message": "Model returned empty choices."})
+            choice = choices[0]
+            message = choice.get("message") if isinstance(choice, dict) else None
+            text = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(text, str):
+                raise HTTPException(status_code=502, detail={"error": "invalid_response", "message": "message.content must be a string."})
+            usage = response.get("usage")
+            logger.info("Inference OK: finish=%s tokens=%s", choice.get("finish_reason"), usage.get("total_tokens") if usage else "?")
+            return ModelEngineResult(
+                text=text,
+                finish_reason=choice.get("finish_reason", "stop"),
+                usage=usage,
             )
-        choice = choices[0]
-        message = choice.get("message") if isinstance(choice, dict) else None
-        text = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(text, str):
-            raise RuntimeError(
-                "Model returned unexpected response format: message.content must be a string."
-            )
-        usage = response.get("usage")
-        return ModelEngineResult(
-            text=text,
-            finish_reason=choice.get("finish_reason", "stop"),
-            usage=usage,
-        )
 
 
 class ModelManager:
-    def __init__(self, model_map: dict[str, str], default_model: str | None):
+    def __init__(self, model_map: dict[str, str], default_model: str | None, *, config: Any | None = None):
         self._model_map = model_map
         self._default_model = default_model or (next(iter(model_map), None))
+        self._config = config
         self._engines: dict[str, GGUFEngine] = {}
-        self._n_ctx = _env_int("N_CTX", _env_int("NIBLIT_CONTEXT_WINDOW", 16384))
-        self._n_threads = _env_int("N_THREADS", 4)
-        self._n_batch = _env_int("NIBLIT_N_BATCH", _env_int("N_BATCH", 1024))
-        self._n_ubatch = _env_int("NIBLIT_N_UBATCH", _env_int("N_UBATCH", 512))
-        self._context_reserve_tokens = _env_int("NIBLIT_CONTEXT_RESERVE_TOKENS", 512)
-        self._min_generation_tokens = _env_int("NIBLIT_MIN_GENERATION_TOKENS", 64)
-        self._char_to_token_ratio = max(1, _env_int("NIBLIT_CHAR_PER_TOKEN", 4))
-        self._memory_guard_ratio = max(
-            0.5,
-            min(0.98, _env_float("NIBLIT_MEMORY_GUARD_RATIO", 0.92) or 0.92),
-        )
-        self._runtime_options = {
-            "n_batch": self._n_batch,
-            "n_ubatch": self._n_ubatch,
-            "rope_freq_base": _env_float("NIBLIT_ROPE_FREQ_BASE", None),
-            "rope_freq_scale": _env_float("NIBLIT_ROPE_FREQ_SCALE", None),
-        }
+        if config is not None:
+            self._n_ctx = config.n_ctx
+            self._n_threads = config.n_threads
+            self._n_batch = config.n_batch
+            self._n_ubatch = config.n_ubatch
+            self._context_reserve_tokens = config.context_reserve_tokens
+            self._min_generation_tokens = config.min_generation_tokens
+            self._char_to_token_ratio = config.char_per_token
+            self._memory_guard_ratio = config.memory_guard_ratio
+            self._runtime_options = {
+                "n_batch": config.n_batch,
+                "n_ubatch": config.n_ubatch,
+                "rope_freq_base": config.rope_freq_base,
+                "rope_freq_scale": config.rope_freq_scale,
+            }
+        else:
+            def _env_int(name: str, default: int) -> int:
+                raw = os.getenv(name)
+                if raw is None:
+                    return default
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return default
+            def _env_float(name: str, default: float | None = None) -> float | None:
+                raw = os.getenv(name)
+                if raw is None:
+                    return default
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return default
+            self._n_ctx = _env_int("N_CTX", _env_int("NIBLIT_CONTEXT_WINDOW", 16384))
+            self._n_threads = _env_int("N_THREADS", 4)
+            self._n_batch = _env_int("NIBLIT_N_BATCH", _env_int("N_BATCH", 1024))
+            self._n_ubatch = _env_int("NIBLIT_N_UBATCH", _env_int("N_UBATCH", 512))
+            self._context_reserve_tokens = _env_int("NIBLIT_CONTEXT_RESERVE_TOKENS", 512)
+            self._min_generation_tokens = _env_int("NIBLIT_MIN_GENERATION_TOKENS", 64)
+            self._char_to_token_ratio = max(1, _env_int("NIBLIT_CHAR_PER_TOKEN", 4))
+            self._memory_guard_ratio = max(
+                0.5, min(0.98, _env_float("NIBLIT_MEMORY_GUARD_RATIO", 0.92) or 0.92),
+            )
+            self._runtime_options = {
+                "n_batch": self._n_batch,
+                "n_ubatch": self._n_ubatch,
+                "rope_freq_base": _env_float("NIBLIT_ROPE_FREQ_BASE", None),
+                "rope_freq_scale": _env_float("NIBLIT_ROPE_FREQ_SCALE", None),
+            }
         self._stats: dict[str, Any] = {
             "requests_total": 0,
             "context_trim_events": 0,
@@ -202,33 +318,24 @@ class ModelManager:
         }
         self._lock = threading.Lock()
         logger.info(
-            "ModelManager initialized: models=%s default=%s n_ctx=%d n_threads=%d n_batch=%d n_ubatch=%d",
+            "ModelManager initialized: models=%s default=%s n_ctx=%d n_threads=%d",
             list(model_map.keys()),
             self._default_model,
             self._n_ctx,
             self._n_threads,
-            self._n_batch,
-            self._n_ubatch,
         )
 
     def get_default_model_info(self) -> dict[str, str]:
-        """Return {model_id, model_path} for the default model (empty strings if none)."""
         with self._lock:
             model_id = self._default_model or ""
             model_path = self._model_map.get(model_id, "") if model_id else ""
         return {"model_id": model_id, "model_path": model_path}
 
     def get_active_model_id(self) -> str | None:
-        """Return the current active/default model ID."""
         with self._lock:
             return self._default_model
 
     def set_active_model(self, model_id: str) -> str:
-        """Switch the active (default) model to *model_id*.
-
-        Returns the previous active model ID.  Raises HTTPException 404 if
-        *model_id* is not registered.
-        """
         with self._lock:
             if model_id not in self._model_map:
                 raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
@@ -238,22 +345,12 @@ class ModelManager:
         return previous or ""
 
     def reload_model(self, model_id: str) -> bool:
-        """Hot reload a specific model while the server stays online.
-
-        Returns True when a fresh engine instance is loaded.
-
-        Raises HTTPException:
-        - 404 if model_id is unknown or the model file path does not exist.
-        - 502 if the backend engine fails to initialize for the model.
-        """
         with self._lock:
             if model_id not in self._model_map:
                 raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
             model_path = self._model_map[model_id]
-
         if not os.path.isfile(model_path):
             raise HTTPException(status_code=404, detail=f"Model file not found: {model_path}")
-
         try:
             engine = GGUFEngine(
                 model_path=model_path,
@@ -263,7 +360,6 @@ class ModelManager:
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-
         with self._lock:
             self._engines[model_id] = engine
         logger.info("Model reloaded successfully: %s", model_id)
@@ -277,21 +373,25 @@ class ModelManager:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
         return {"id": model_id, "object": "model"}
 
-    def resolve_model_id(self, request_model: str | None, path_model: str | None) -> str:
-        """Resolve model precedence as request model > path model > default model.
+    def list_models_detailed(self) -> list[dict[str, Any]]:
+        result = []
+        for mid, path in self._model_map.items():
+            result.append({
+                "id": mid,
+                "object": "model",
+                "path": path,
+                "loaded": mid in self._engines,
+            })
+        return result
 
-        The string ``"local"`` (and other well-known aliases set in
-        _LOCAL_MODEL_ALIASES) is mapped to the configured default model so that
-        Niblit's ``QwenLocalBrain`` HTTP backend — which always sends
-        ``"model": "local"`` — works without any client-side configuration.
-        """
+    def resolve_model_id(self, request_model: str | None, path_model: str | None) -> str:
         with self._lock:
             default = self._default_model
         model_id = request_model or path_model or default
         if not model_id:
             raise HTTPException(status_code=400, detail="No model provided.")
-        # Resolve well-known aliases (e.g. "local" sent by Niblit's local_brain)
-        if model_id.lower() in _LOCAL_MODEL_ALIASES:
+        raw = model_id.lower()
+        if raw in _LOCAL_MODEL_ALIASES:
             if not default:
                 raise HTTPException(
                     status_code=503,
@@ -308,50 +408,36 @@ class ModelManager:
     def chat(
         self, model_id: str, messages: list[dict[str, str]], temperature: float, max_tokens: int
     ) -> ModelEngineResult:
-        if model_id not in self._engines:
-            self._engines[model_id] = GGUFEngine(
-                model_path=self._model_map[model_id],
-                n_ctx=self._n_ctx,
-                n_threads=self._n_threads,
-                runtime_options=self._runtime_options,
-            )
+        with self._lock:
+            if model_id not in self._engines:
+                self._engines[model_id] = GGUFEngine(
+                    model_path=self._model_map[model_id],
+                    n_ctx=self._n_ctx,
+                    n_threads=self._n_threads,
+                    runtime_options=self._runtime_options,
+                )
+            engine = self._engines[model_id]
         plan = self._prepare_inference(messages=messages, max_tokens=max_tokens)
         logger.debug(
             "chat request: model=%s messages=%d temperature=%s max_tokens=%d effective_max_tokens=%d",
-            model_id,
-            len(messages),
-            temperature,
-            max_tokens,
-            plan["effective_max_tokens"],
+            model_id, len(messages), temperature, max_tokens, plan["effective_max_tokens"],
         )
         try:
-            result = self._engines[model_id].chat(
+            result = engine.chat(
                 messages=plan["messages"], temperature=temperature, max_tokens=plan["effective_max_tokens"]
             )
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError, MemoryError) as exc:
             logger.error("Inference error for model %s: %s", model_id, exc)
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         with self._lock:
             self._stats["requests_total"] += 1
             if plan["messages_truncated"]:
                 self._stats["context_trim_events"] += 1
-                logger.info(
-                    "Context truncation applied for model=%s prompt_tokens=%d requested_max_tokens=%d effective_max_tokens=%d",
-                    model_id,
-                    plan["prompt_tokens_estimate"],
-                    max_tokens,
-                    plan["effective_max_tokens"],
-                )
             if plan["effective_max_tokens"] < max_tokens:
                 self._stats["max_token_clamp_events"] += 1
             self._stats["last_prompt_tokens_estimate"] = plan["prompt_tokens_estimate"]
             self._stats["last_effective_max_tokens"] = plan["effective_max_tokens"]
             self._stats["last_context_usage_ratio"] = round(plan["context_usage_ratio"], 4)
-        logger.debug(
-            "chat response: model=%s finish_reason=%s",
-            model_id,
-            result.finish_reason,
-        )
         return result
 
     def estimate_inference(self, messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:
@@ -383,12 +469,10 @@ class ModelManager:
         safe_messages = [dict(m) for m in messages]
         requested_max_tokens = max(1, int(max_tokens))
         target_ctx_budget = max(256, int(self._n_ctx * self._memory_guard_ratio))
-
         prompt_tokens = self._estimate_tokens(safe_messages)
         min_generation = max(16, min(self._min_generation_tokens, requested_max_tokens))
         max_prompt_budget = max(64, target_ctx_budget - max(self._context_reserve_tokens, min_generation))
         messages_truncated = False
-
         if prompt_tokens > max_prompt_budget and safe_messages:
             kept: list[dict[str, str]] = []
             running_tokens = 0
@@ -402,7 +486,6 @@ class ModelManager:
                 if running_tokens >= max_prompt_budget:
                     break
             safe_messages = list(reversed(kept)) or [source_messages[-1]]
-
             if safe_messages:
                 prompt_tokens = self._estimate_tokens(safe_messages)
             if prompt_tokens > max_prompt_budget and safe_messages:
@@ -413,11 +496,7 @@ class ModelManager:
                     safe_messages[-1] = last
                     messages_truncated = True
                 prompt_tokens = self._estimate_tokens(safe_messages)
-
-        available_for_generation = max(
-            1,
-            target_ctx_budget - prompt_tokens - self._context_reserve_tokens,
-        )
+        available_for_generation = max(1, target_ctx_budget - prompt_tokens - self._context_reserve_tokens)
         effective_max_tokens = max(1, min(requested_max_tokens, available_for_generation))
         context_usage_ratio = (prompt_tokens + effective_max_tokens) / max(1, self._n_ctx)
         memory_pressure = min(1.0, (prompt_tokens + requested_max_tokens) / max(1, target_ctx_budget))
@@ -440,13 +519,9 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = _DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
     stream: bool = False
-    # Accepted for llama-server API compatibility; passed through to the engine.
     stop: list[str] | None = None
-    # Tool schemas (Niblit generate_with_tools); accepted and ignored if not supported.
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | None = None
-    # ── Cognitive envelope fields (Phase Ω.7) — all optional ──────────────────
-    # Plain OpenAI/HF requests that omit these fields remain fully compatible.
     intent: str | None = None
     execution_mode: str | None = None
     coherence_score: float | None = None
@@ -465,13 +540,6 @@ class ChatCompletionRequest(BaseModel):
 
 
 class CompletionRequest(BaseModel):
-    """Legacy llama-server /completion endpoint schema.
-
-    Niblit's ``QwenLocalBrain._generate_http_legacy()`` falls back to this
-    endpoint when ``POST /v1/chat/completions`` returns HTTP 404.  The
-    request body uses ``prompt`` (plain string) and ``n_predict`` (max tokens).
-    """
-
     prompt: str
     n_predict: int = _DEFAULT_MAX_TOKENS
     temperature: float = _DEFAULT_TEMPERATURE
@@ -518,11 +586,17 @@ def _build_chat_response(model_id: str, result: ModelEngineResult) -> dict[str, 
     return payload
 
 
-def create_app(model_manager: ModelManager | None = None) -> FastAPI:
-    models, default_model = _build_default_model_map()
-    _manager = model_manager or ModelManager(models, default_model)
+def create_app(model_manager: Any | None = None, config: Any | None = None) -> FastAPI:
+    if config is None:
+        config = _get_config()
+    if model_manager is not None:
+        _manager = model_manager
+    else:
+        models = config.model_map
+        default_model = config.default_model
+        _manager = ModelManager(models, default_model, config=config)
+    _model_registry = _try_import_model_registry()
 
-    # ── Boot cognitive runtime subsystems ─────────────────────────────────────
     _event_bus_mod   = _try_import("app.event_bus")
     _envelope_mod    = _try_import("app.cognitive_envelope")
     _governance_mod  = _try_import("app.cloud_governance")
@@ -535,35 +609,29 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     _federation_mod  = _try_import("app.federation")
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(application: FastAPI):
         info = _manager.get_default_model_info()
         logger.info(
-            "Niblit Cognitive Cloud Runtime starting — models=%s default=%s",
-            list(models.keys()),
-            info["model_id"] or "(none)",
+            "Niblit Cognitive Cloud Runtime: models=%s default=%s",
+            list(models.keys()), info["model_id"] or "(none)",
         )
-        # Seed orchestrator with known model IDs
         if _orchestrator_mod:
             _orchestrator_mod.get_model_orchestrator(model_ids=list(models.keys()))
-        # Initialize node identity
         if _identity_mod:
             _identity_mod.get_node_identity()
         if _federation_mod:
             _federation_mod.get_federation_manager()
         yield
-        logger.info("Niblit Cognitive Cloud Runtime shutdown complete.")
+        logger.info("Niblit Cognitive Cloud Runtime shutdown.")
 
     app = FastAPI(
         title="Niblit Cognitive Cloud Runtime",
-        version="0.7.0",
-        description=(
-            "Distributed cognitive execution + cognition + orchestration node. "
-            "Backward compatible with HuggingFace-style APIs, llama.cpp, and "
-            "QwenLocalBrain. Phase Ω.7."
-        ),
+        version="0.9.0",
+        description="Niblit Cloud Server — inference layer. Backward compatible with OpenAI, HF, llama.cpp.",
         lifespan=lifespan,
     )
     app.state.model_manager = _manager
+    app.state.cloud_config = config
     _cursor_gateway = get_cursor_gateway()
 
     @app.exception_handler(HTTPException)
@@ -590,14 +658,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         start = time.perf_counter()
         response = await call_next(request)
         duration_ms = (time.perf_counter() - start) * 1000
-        logger.info(
-            "%s %s -> %d (%.1f ms)",
-            request.method,
-            request.url.path,
-            response.status_code,
-            duration_ms,
-        )
-        # Increment node identity request counter
+        logger.info("%s %s -> %d (%.1f ms)", request.method, request.url.path, response.status_code, duration_ms)
         if _identity_mod:
             try:
                 _identity_mod.get_node_identity().increment_request()
@@ -605,34 +666,54 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 pass
         return response
 
-    # ── Existing health/probe endpoints (unchanged) ───────────────────────────
-
     @app.get("/healthz")
     @app.get("/health")
     def health() -> dict[str, str]:
-        """Health check — responds to both /health (llama-server probe) and /healthz."""
         return {"status": "ok"}
 
     @app.get("/props")
     def props() -> dict[str, Any]:
-        """Legacy llama-server /props probe endpoint."""
         manager: ModelManager = app.state.model_manager
         info = manager.get_default_model_info()
-        return {
-            "model_path": info["model_path"],
-            "total_slots": 1,
-        }
+        return {"model_path": info["model_path"], "total_slots": 1}
 
     @app.get("/v1/models")
     @app.get("/models")
     def list_models(request: Request) -> dict[str, Any]:
         start = _cursor_gateway.log_incoming(request, path="/v1/models", model=None)
         manager: ModelManager = app.state.model_manager
-        payload = _cursor_gateway.adapt_models_response(
-            {"object": "list", "data": manager.list_models()}
-        )
+        payload = {"object": "list", "data": manager.list_models()}
+        adapted = _cursor_gateway.adapt_models_response(payload)
         _cursor_gateway.log_complete(start, status_code=200)
-        return payload
+        return adapted
+
+    @app.get("/v1/models/detail")
+    def list_models_detailed() -> dict[str, Any]:
+        manager: ModelManager = app.state.model_manager
+        config: Any = getattr(app.state, "cloud_config", None)
+        aliases = {alias: (config.default_model_id or "") for alias in sorted(_LOCAL_MODEL_ALIASES)}
+        return {
+            "default": config.default_model_id or "",
+            "aliases": {k: v for k, v in aliases.items() if v},
+            "providers": {
+                "qwen_server": bool(config.qwen_model_path and config.qwen_backend_bin),
+                "ollama": bool(config.ollama_base_url),
+                "openai": bool(config.openai_api_base or config.openai_api_key),
+                "anthropic": bool(config.anthropic_api_key),
+                "huggingface": bool(config.hf_api_key),
+                "llama_cpp": bool(config.llama_cpp_server_url),
+                "vllm": bool(config.vllm_api_base),
+                "remote": bool(config.remote_api_base_url),
+            },
+            "models": manager.list_models_detailed(),
+        }
+
+    @app.get("/v1/config")
+    def get_config_endpoint() -> dict[str, Any]:
+        config: Any = getattr(app.state, "cloud_config", None)
+        if config is None:
+            return {"error": "config_not_loaded"}
+        return config.summary()
 
     @app.get("/v1/models/{model_id}")
     @app.get("/models/{model_id}/info")
@@ -640,10 +721,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         manager: ModelManager = app.state.model_manager
         return manager.get_model(model_id)
 
-    # ── Internal helper: extract envelope from request ────────────────────────
-
     def _extract_envelope(payload: ChatCompletionRequest) -> dict[str, Any]:
-        """Build a cognitive envelope dict from the request payload fields."""
         if _envelope_mod is None:
             return {}
         raw: dict[str, Any] = {}
@@ -679,17 +757,40 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             raw["identity_context"] = payload.identity_context
         return _envelope_mod.normalize_envelope(raw)
 
-    # ── Core chat handler (shared by all chat endpoints) ─────────────────────
+    @app.get("/v1/runtime")
+    def runtime_detail() -> dict[str, Any]:
+        """Health diagnostic endpoint for inference runtime."""
+        manager: ModelManager = app.state.model_manager
+        engine_info = {}
+        for mid in manager._model_map:
+            engine = manager._engines.get(mid)
+            if engine:
+                engine_info[mid] = {
+                    "loaded": True,
+                    "model_path": manager._model_map[mid],
+                    "n_ctx": manager._n_ctx,
+                    "n_threads": manager._n_threads,
+                    "metadata": getattr(engine, "metadata", {}),
+                }
+            else:
+                engine_info[mid] = {
+                    "loaded": False,
+                    "model_path": manager._model_map[mid],
+                }
+        return {
+            "runtime": "niblit_cognitive_cloud_runtime",
+            "models": manager.list_models(),
+            "default_model": manager.get_default_model_info(),
+            "engines": engine_info,
+            "context_runtime": manager.runtime_stats(),
+        }
 
     def handle_chat(payload: ChatCompletionRequest, path_model: str | None = None) -> dict[str, Any]:
         start_ms = time.perf_counter() * 1000
         request_id = uuid.uuid4().hex
-
         manager: ModelManager = app.state.model_manager
         messages = _normalize_messages(payload.messages)
         inference_plan = manager.estimate_inference(messages=messages, max_tokens=payload.max_tokens)
-
-        # ── Build cognitive envelope ───────────────────────────────────────────
         envelope = _extract_envelope(payload)
         if inference_plan["memory_pressure"] >= 0.85:
             envelope["resource_mode"] = "conservative"
@@ -697,8 +798,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             runtime_ctx["mode"] = "cautious"
             runtime_ctx["attention_pressure"] = min(1.0, inference_plan["memory_pressure"])
             envelope["runtime"] = runtime_ctx
-
-        # ── Attention allocation ───────────────────────────────────────────────
         allocation = None
         if _attention_mod:
             try:
@@ -718,8 +817,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 raise
             except Exception:
                 pass
-
-        # ── Governance validation ──────────────────────────────────────────────
         governance_vetoed = False
         if _governance_mod:
             try:
@@ -727,9 +824,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                     action="chat_inference",
                     context={
                         "prompt_tokens_estimate": inference_plan["prompt_tokens_estimate"],
-                        "estimated_total_tokens": (
-                            inference_plan["prompt_tokens_estimate"] + payload.max_tokens
-                        ),
+                        "estimated_total_tokens": inference_plan["prompt_tokens_estimate"] + payload.max_tokens,
                         "context_window": manager.runtime_stats().get("context_window"),
                     },
                     envelope=envelope,
@@ -751,8 +846,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 raise
             except Exception:
                 pass
-
-        # ── Temporal sync ──────────────────────────────────────────────────────
         if _temporal_mod:
             try:
                 _temporal_mod.get_temporal_sync().record_request(
@@ -761,11 +854,8 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 )
             except Exception:
                 pass
-
-        # ── Model orchestration ────────────────────────────────────────────────
         available_models = list(manager._model_map.keys())
         request_model_id = manager.resolve_model_id(payload.model, path_model)
-
         if _orchestrator_mod and len(available_models) > 1:
             try:
                 decision = _orchestrator_mod.get_model_orchestrator().route(
@@ -773,24 +863,19 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                     default_model=request_model_id,
                     envelope=envelope,
                 )
-                # Only use orchestrated model if it matches one we can resolve
                 if decision.model_id in available_models:
                     request_model_id = decision.model_id
             except Exception:
                 pass
-
         result = manager.chat(
             model_id=request_model_id,
             messages=messages,
             temperature=payload.temperature,
             max_tokens=payload.max_tokens,
         )
-
         end_ms = time.perf_counter() * 1000
         latency_ms = end_ms - start_ms
         token_count = (result.usage or {}).get("completion_tokens", 0)
-
-        # ── Record outcome in subsystems ───────────────────────────────────────
         if _orchestrator_mod:
             try:
                 _orchestrator_mod.get_model_orchestrator().record_outcome(
@@ -798,7 +883,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 )
             except Exception:
                 pass
-
         if _reflection_mod:
             try:
                 quality = min(1.0, max(0.0, 1.0 - latency_ms / 10_000))
@@ -813,16 +897,12 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 )
             except Exception:
                 pass
-
         if _attention_mod and allocation:
             try:
                 _attention_mod.get_attention_allocator().release(request_id)
             except Exception:
                 pass
-
         response = _build_chat_response(request_model_id, result)
-
-        # Attach cognitive metadata if envelope was supplied
         if envelope.get("intent"):
             response["cognitive"] = {
                 "request_id": request_id,
@@ -837,7 +917,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                     "memory_pressure": round(inference_plan["memory_pressure"], 4),
                 },
             }
-
         return response
 
     def stream_chat_completion(
@@ -850,7 +929,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         content = message.get("content", "") if isinstance(message, dict) else ""
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         created_ts = int(time.time())
-
         first = {
             "id": chunk_id,
             "object": "chat.completion.chunk",
@@ -880,25 +958,18 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         manager: ModelManager = app.state.model_manager
         available_models = [entry["id"] for entry in manager.list_models()]
         default_model = manager.get_active_model_id()
-
         adapted, gw_ctx = _cursor_gateway.prepare_chat(
-            payload,
-            path_model=path_model,
-            available_models=available_models,
-            default_model=default_model,
+            payload, path_model=path_model,
+            available_models=available_models, default_model=default_model,
         )
         model = _cursor_gateway.resolve_request_model(adapted, path_model)
-        start = _cursor_gateway.log_incoming(
-            request, path="/v1/chat/completions", model=model
-        )
+        start = _cursor_gateway.log_incoming(request, path="/v1/chat/completions", model=model)
         try:
             if adapted.stream:
                 return StreamingResponse(
                     _cursor_gateway.wrap_stream(
                         stream_chat_completion(adapted, path_model),
-                        start=start,
-                        model=model,
-                        ctx=gw_ctx,
+                        start=start, model=model, ctx=gw_ctx,
                     ),
                     media_type="text/event-stream",
                     headers=_cursor_gateway.stream_headers,
@@ -908,24 +979,17 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             _cursor_gateway.log_complete(start, status_code=200, model=model)
             return response
         except HTTPException as exc:
-            _cursor_gateway.finalize_chat(
-                gw_ctx,
-                status_code=exc.status_code,
-                error=_detail_to_message(exc.detail),
-            )
+            _cursor_gateway.finalize_chat(gw_ctx, status_code=exc.status_code, error=_detail_to_message(exc.detail))
             raise
 
     @app.post("/completion")
     def legacy_completion(payload: CompletionRequest) -> dict[str, Any]:
-        """Legacy llama-server ``POST /completion`` endpoint."""
         manager: ModelManager = app.state.model_manager
         model_id = manager.resolve_model_id(payload.model, None)
         messages: list[dict[str, str]] = [{"role": "user", "content": payload.prompt}]
         result = manager.chat(
-            model_id=model_id,
-            messages=messages,
-            temperature=payload.temperature,
-            max_tokens=payload.n_predict,
+            model_id=model_id, messages=messages,
+            temperature=payload.temperature, max_tokens=payload.n_predict,
         )
         return {"content": result.text}
 
@@ -939,29 +1003,22 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             messages = [{"role": "user", "content": payload.inputs}]
         else:
             raise HTTPException(status_code=400, detail="Provide either inputs or messages")
-
         temperature = float(payload.parameters.get("temperature", _DEFAULT_TEMPERATURE))
         max_tokens = int(payload.parameters.get("max_new_tokens", _DEFAULT_MAX_TOKENS))
         result = manager.chat(
-            model_id=model_id,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            model_id=model_id, messages=messages,
+            temperature=temperature, max_tokens=max_tokens,
         )
         return {"generated_text": result.text, "model": model_id}
 
-    # ── Cognitive chat endpoint (enriched response) ───────────────────────────
-
     @app.post("/v1/cognitive/chat")
     def cognitive_chat(payload: ChatCompletionRequest) -> dict[str, Any]:
-        """Cognitive chat endpoint — same as /v1/chat/completions with richer metadata."""
         return handle_chat(payload)
 
-    # ── Runtime status endpoints ───────────────────────────────────────────────
+    # ── Runtime status endpoints ───────────────────────────────────────────
 
     @app.get("/v1/runtime/status")
     def runtime_status() -> dict[str, Any]:
-        """Full runtime status snapshot."""
         manager: ModelManager = app.state.model_manager
         status: dict[str, Any] = {
             "runtime": "niblit_cognitive_cloud_runtime",
@@ -990,7 +1047,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/v1/runtime/coherence")
     def runtime_coherence() -> dict[str, Any]:
-        """Temporal coherence and epoch sync status."""
         result: dict[str, Any] = {}
         if _temporal_mod:
             try:
@@ -1001,7 +1057,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/v1/runtime/governance")
     def runtime_governance() -> dict[str, Any]:
-        """Constitutional governance statistics."""
         result: dict[str, Any] = {}
         if _governance_mod:
             try:
@@ -1012,7 +1067,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/v1/runtime/attention")
     def runtime_attention() -> dict[str, Any]:
-        """Attention economy metrics."""
         result: dict[str, Any] = {}
         if _attention_mod:
             try:
@@ -1023,11 +1077,8 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/v1/runtime/models")
     def runtime_models() -> dict[str, Any]:
-        """Model orchestration health and routing statistics."""
         manager: ModelManager = app.state.model_manager
-        result: dict[str, Any] = {
-            "registered_models": manager.list_models(),
-        }
+        result: dict[str, Any] = {"registered_models": manager.list_models()}
         if _orchestrator_mod:
             try:
                 result["orchestrator"] = _orchestrator_mod.get_model_orchestrator().status()
@@ -1035,31 +1086,17 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 result["orchestrator_error"] = "unavailable"
         return result
 
-    # ── Model switch endpoints ─────────────────────────────────────────────────
-
     class ModelSwitchRequest(BaseModel):
         model_id: str
 
     @app.get("/v1/runtime/model/active")
     def get_active_model() -> dict[str, Any]:
-        """Return the currently active (default) model and all registered models."""
         manager: ModelManager = app.state.model_manager
         active = manager.get_active_model_id()
-        return {
-            "active_model": active or "",
-            "available_models": [m["id"] for m in manager.list_models()],
-        }
+        return {"active_model": active or "", "available_models": [m["id"] for m in manager.list_models()]}
 
     @app.post("/v1/runtime/model/switch")
     def switch_model(payload: ModelSwitchRequest) -> dict[str, Any]:
-        """Switch the active model to *payload.model_id* while the server is running.
-
-        Both llama3 and qwen (or any other registered GGUF) model IDs are
-        accepted.  The new default is applied immediately — subsequent requests
-        that use the ``"local"`` alias will be routed to the switched model.
-
-        Returns 404 if *model_id* is not registered in GGUF_MODELS_JSON.
-        """
         manager: ModelManager = app.state.model_manager
         reloaded = manager.reload_model(payload.model_id)
         previous = manager.set_active_model(payload.model_id)
@@ -1069,16 +1106,10 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             except Exception as exc:
                 logger.warning("switch_model: orchestrator registration failed: %s", exc)
         logger.info("Model switch requested: %s -> %s", previous, payload.model_id)
-        return {
-            "status": "switched",
-            "active_model": payload.model_id,
-            "previous_model": previous,
-            "reloaded": reloaded,
-        }
+        return {"status": "switched", "active_model": payload.model_id, "previous_model": previous, "reloaded": reloaded}
 
     @app.get("/v1/runtime/reflection")
     def runtime_reflection() -> dict[str, Any]:
-        """Reflection engine telemetry."""
         result: dict[str, Any] = {}
         if _reflection_mod:
             try:
@@ -1092,7 +1123,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/v1/runtime/trading")
     def runtime_trading() -> dict[str, Any]:
-        """Trading cognition bridge status and market state."""
         result: dict[str, Any] = {}
         if _trading_mod:
             try:
@@ -1105,22 +1135,16 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/v1/runtime/epoch")
     def runtime_epoch() -> dict[str, Any]:
-        """Current epoch and temporal ordering state."""
         if _temporal_mod:
             try:
                 ts = _temporal_mod.get_temporal_sync()
-                return {
-                    "epoch_id": ts.current_epoch(),
-                    "coherence": round(ts.coherence(), 4),
-                    "status": ts.status(),
-                }
+                return {"epoch_id": ts.current_epoch(), "coherence": round(ts.coherence(), 4), "status": ts.status()}
             except Exception:
                 pass
         return {"epoch_id": int(time.time()), "coherence": 1.0}
 
     @app.get("/v1/runtime/mode")
     def runtime_mode() -> dict[str, Any]:
-        """Current runtime/governance mode and adaptation posture."""
         mode = _normalize_runtime_mode(os.getenv("NIBLIT_RUNTIME_MODE", "normal"))
         strict = None
         reasons: list[str] = []
@@ -1161,7 +1185,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/v1/runtime/node")
     def runtime_node() -> dict[str, Any]:
-        """Node identity + cluster/federation posture."""
         node: dict[str, Any] = {}
         if _identity_mod:
             try:
@@ -1177,7 +1200,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/v1/runtime/topology")
     def runtime_topology() -> dict[str, Any]:
-        """Topology-aware runtime coordination summary."""
         profile = os.getenv("NIBLIT_PROFILE", "cloud-server")
         mode = runtime_mode().get("mode", "normal")
         topology: dict[str, Any] = {
@@ -1210,7 +1232,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         return topology
 
     def _build_runtime_envelope_snapshot() -> dict[str, Any]:
-        """Build schema-v2 envelope JSON for lean-algos RuntimeAdapter (non-inference)."""
         ts = int(time.time())
         mode_info = runtime_mode()
         mode = str(mode_info.get("mode", "normal"))
@@ -1242,7 +1263,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         envelope["temporal"]["coherence_drift"] = 0.0
         envelope["resources"]["cognitive_budget"] = 1.0
         envelope["resources"]["attention_available"] = 1.0
-
         if _temporal_mod:
             try:
                 temporal_status = _temporal_mod.get_temporal_sync().status()
@@ -1274,12 +1294,10 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
     @app.get("/niblit/runtime")
     @app.get("/v1/runtime/envelope")
     def runtime_envelope_snapshot() -> dict[str, Any]:
-        """Envelope-compatible runtime snapshot for execution-node adapters."""
         return _build_runtime_envelope_snapshot()
 
     @app.get("/v1/runtime/diagnostics")
     def runtime_diagnostics() -> dict[str, Any]:
-        """Operational diagnostics for governance-aware runtime operations."""
         manager: ModelManager = app.state.model_manager
         diagnostics: dict[str, Any] = {
             "runtime_health": 1.0,
@@ -1289,8 +1307,7 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             "model_latency_ema": {},
             "governance_violations": {},
             "thermal_resource_state": {
-                "cpu_load": None,
-                "memory_pressure": None,
+                "cpu_load": None, "memory_pressure": None,
                 "resource_mode": "balanced",
                 "note": "Host thermal metrics are not available in-process.",
             },
@@ -1299,12 +1316,10 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             "federation": {"status": "standalone"},
             "topology": {},
         }
-
         try:
             diagnostics["runtime_health"] = 1.0 if health().get("status") == "ok" else 0.0
         except Exception:
             diagnostics["runtime_health"] = 0.0
-
         if _attention_mod:
             try:
                 a = _attention_mod.get_attention_allocator().status()
@@ -1319,24 +1334,20 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                     diagnostics["thermal_resource_state"]["resource_mode"] = "minimal"
             except Exception:
                 pass
-
         try:
             diagnostics["context_runtime"] = manager.runtime_stats()
             if diagnostics["context_runtime"].get("last_context_usage_ratio", 0.0) >= 0.9:
                 diagnostics["thermal_resource_state"]["resource_mode"] = "conservative"
         except Exception:
             pass
-
         if _orchestrator_mod:
             try:
                 ms = _orchestrator_mod.get_model_orchestrator().status()
                 diagnostics["model_latency_ema"] = {
-                    mid: h.get("latency_ema_ms")
-                    for mid, h in (ms.get("model_health") or {}).items()
+                    mid: h.get("latency_ema_ms") for mid, h in (ms.get("model_health") or {}).items()
                 }
             except Exception:
                 pass
-
         if _governance_mod:
             try:
                 gs = _governance_mod.get_cloud_governance().status()
@@ -1349,7 +1360,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 }
             except Exception:
                 pass
-
         if _reflection_mod:
             try:
                 rs = _reflection_mod.get_reflection_engine().status()
@@ -1362,7 +1372,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 }
             except Exception:
                 pass
-
         if _temporal_mod:
             try:
                 ts = _temporal_mod.get_temporal_sync().status()
@@ -1374,7 +1383,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 }
             except Exception:
                 pass
-
         if _federation_mod:
             try:
                 diagnostics["federation"] = _federation_mod.get_federation_manager().status()
@@ -1384,17 +1392,14 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             diagnostics["topology"] = runtime_topology()
         except Exception:
             pass
-
         return diagnostics
 
     @app.post("/v1/bridge/inference")
     async def bridge_inference(request: Request) -> dict[str, Any]:
-        """Accept a shared Niblit message contract and return a completed inference envelope."""
         manager: ModelManager = app.state.model_manager
         payload = await request.json()
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
-
         message_type = str(payload.get("message_type", "")).strip()
         source = str(payload.get("source", "unknown")).strip()
         target = str(payload.get("target", "unknown")).strip()
@@ -1403,17 +1408,14 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         message_payload = payload.get("payload", {})
         if not isinstance(message_payload, dict):
             raise HTTPException(status_code=400, detail="payload must be an object")
-
         prompt = str(message_payload.get("prompt") or "").strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="payload.prompt is required")
-
         model_id = str(message_payload.get("model_id") or manager.get_active_model_id() or "").strip()
         resolved_model = model_id
         response_text = f"Bridge response: {prompt}"
         finish_reason = "fallback"
         usage: dict[str, int] | None = None
-
         if model_id:
             try:
                 resolved_model = manager.resolve_model_id(request_model=model_id, path_model=None)
@@ -1435,7 +1437,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         else:
             response_text = f"Bridge response: {prompt}"
             usage = {"prompt_tokens": len(prompt.split()), "completion_tokens": 0, "total_tokens": len(prompt.split())}
-
         return {
             "message_type": "ai.inference.completed",
             "source": "niblit-cloud-server",
@@ -1452,11 +1453,8 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
             },
         }
 
-    # ── Metrics endpoints ──────────────────────────────────────────────────────
-
     @app.get("/metrics/cognitive")
     def metrics_cognitive() -> dict[str, Any]:
-        """Cognitive telemetry metrics."""
         result: dict[str, Any] = {}
         if _reflection_mod:
             try:
@@ -1467,7 +1465,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/metrics/coherence")
     def metrics_coherence() -> dict[str, Any]:
-        """Coherence metrics."""
         if _temporal_mod:
             try:
                 return _temporal_mod.get_temporal_sync().status()
@@ -1477,7 +1474,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/metrics/governance")
     def metrics_governance() -> dict[str, Any]:
-        """Governance metrics."""
         if _governance_mod:
             try:
                 return _governance_mod.get_cloud_governance().status()
@@ -1487,7 +1483,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/metrics/models")
     def metrics_models() -> dict[str, Any]:
-        """Model routing and health metrics."""
         if _orchestrator_mod:
             try:
                 return _orchestrator_mod.get_model_orchestrator().status()
@@ -1495,11 +1490,8 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 pass
         return {}
 
-    # ── Cluster / swarm readiness endpoints ───────────────────────────────────
-
     @app.get("/cluster/status")
     def cluster_status() -> dict[str, Any]:
-        """Cluster status (single-node; federation not yet implemented)."""
         fed_status: dict[str, Any] = {}
         if _federation_mod:
             try:
@@ -1518,7 +1510,6 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/cluster/identity")
     def cluster_identity() -> dict[str, Any]:
-        """Node identity and fingerprint."""
         if _identity_mod:
             try:
                 return _identity_mod.get_node_identity().snapshot().to_dict()
@@ -1528,15 +1519,12 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
 
     @app.get("/cluster/capabilities")
     def cluster_capabilities() -> dict[str, Any]:
-        """Advertised node capabilities."""
         if _identity_mod:
             try:
                 return _identity_mod.get_node_identity().snapshot().capabilities.to_dict()
             except Exception:
                 pass
         return {}
-
-    # ── Federation preparation endpoints (stubs) ──────────────────────────────
 
     @app.get("/federation/status")
     def federation_status() -> dict[str, Any]:
@@ -1618,7 +1606,13 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
                 return {"synced_to": 0, "error": "federation_epoch_sync_failed"}
         return {"synced_to": 0}
 
-    # ── Compatibility prefix routes (unchanged) ────────────────────────────────
+    # ── Trading API router ──────────────────────────────────────────────────────
+    try:
+        from app.trading.router import router as trading_router
+        app.include_router(trading_router)
+        logger.info("Trading API router registered")
+    except Exception as exc:
+        logger.warning("Trading API router not available: %s", exc)
 
     compat_prefixes = [
         p.strip(" /")
@@ -1626,38 +1620,139 @@ def create_app(model_manager: ModelManager | None = None) -> FastAPI:
         if p.strip()
     ]
     for prefix in compat_prefixes:
-        app.add_api_route(
-            f"/{prefix}/v1/chat/completions",
-            chat_completions,
-            methods=["POST"],
-        )
-        app.add_api_route(
-            f"/{prefix}/chat/completions",
-            chat_completions,
-            methods=["POST"],
-        )
-        app.add_api_route(
-            f"/{prefix}/completion",
-            legacy_completion,
-            methods=["POST"],
-        )
-        app.add_api_route(
-            f"/{prefix}/models/{{path_model}}",
-            inference_api,
-            methods=["POST"],
-        )
-        app.add_api_route(
-            f"/{prefix}/v1/models",
-            list_models,
-            methods=["GET"],
-        )
-        app.add_api_route(
-            f"/{prefix}/health",
-            health,
-            methods=["GET"],
-        )
+        app.add_api_route(f"/{prefix}/v1/chat/completions", chat_completions, methods=["POST"])
+        app.add_api_route(f"/{prefix}/chat/completions", chat_completions, methods=["POST"])
+        app.add_api_route(f"/{prefix}/completion", legacy_completion, methods=["POST"])
+        app.add_api_route(f"/{prefix}/models/{{path_model}}", inference_api, methods=["POST"])
+        app.add_api_route(f"/{prefix}/v1/models", list_models, methods=["GET"])
+        app.add_api_route(f"/{prefix}/health", health, methods=["GET"])
 
     return app
 
 
+def _try_import_model_registry() -> Any:
+    try:
+        import importlib
+        return importlib.import_module("app.model_registry")
+    except Exception:
+        return None
+
+
 app = create_app()
+
+
+def _print_diagnostics(config: Any, manager: Any, registry_count: int, provider_count: int) -> None:
+    print("\nConfiguration Verification", flush=True)
+    print("-------------------------", flush=True)
+    print(f"  CloudConfig:", flush=True)
+    print(f"    models = {len(config.model_map)}", flush=True)
+    print(f"    default = {config.default_model}", flush=True)
+    print(f"  ModelManager:", flush=True)
+    print(f"    models = {len(manager.list_models())}", flush=True)
+    print(f"    default = {manager.get_active_model_id()}", flush=True)
+    print(f"  ModelRegistry:", flush=True)
+    print(f"    models = {registry_count}", flush=True)
+    print(f"  ProviderRegistry:", flush=True)
+    print(f"    providers = {provider_count}", flush=True)
+    models = config.model_map
+    if models and config.default_model:
+        for alias in sorted(_LOCAL_MODEL_ALIASES):
+            print(f"  Alias: {alias} -> {config.default_model}", flush=True)
+    else:
+        print("  Aliases: (no default model configured)", flush=True)
+    print(f"  API: http://{config.host}:{config.port}", flush=True)
+    print(flush=True)
+
+
+def _run_cli() -> None:
+    import uvicorn
+    from app.runtime import CloudRuntime
+    from app.config import get_config
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    cfg = get_config()
+    app.state.cloud_config = cfg
+
+    runtime = CloudRuntime(config=cfg)
+    ready = runtime.run()
+    status = "READY" if ready else "DEGRADED"
+    print(f"\nCloud {status}\n", flush=True)
+    for stage in runtime.stages:
+        print(
+            f"  [{stage.stage.value}] {stage.status} ({stage.duration_ms:.1f} ms): {stage.message}",
+            flush=True,
+        )
+
+    app.state.cloud_runtime = runtime
+    manager = runtime.get_service("model_manager")
+    if manager is not None:
+        app.state.model_manager = manager
+    else:
+        from app.main import ModelManager as _MM
+        manager = _MM(cfg.model_map, cfg.default_model, config=cfg)
+        app.state.model_manager = manager
+
+    registry = runtime.get_service("model_registry")
+    if registry is not None:
+        app.state.model_registry = registry
+
+    p_reg = runtime.get_service("provider_registry")
+    if p_reg is not None:
+        app.state.provider_registry = p_reg
+
+    print("\nObject Identity", flush=True)
+    print("---------------", flush=True)
+    print(f"  CloudConfig ......... {id(cfg)}", flush=True)
+    print(f"  CloudRuntime ........ {id(runtime)}", flush=True)
+    print(f"  ModelManager ........ {id(manager)}", flush=True)
+    if registry:
+        print(f"  ModelRegistry ....... {id(registry)}", flush=True)
+    if p_reg:
+        print(f"  ProviderRegistry .... {id(p_reg)}", flush=True)
+
+    cfg_models = cfg.model_map
+    mm_models = manager.list_models() if manager else []
+    errs = []
+    if len(mm_models) != len(cfg_models):
+        errs.append(
+            f"ModelManager sees {len(mm_models)} models but CloudConfig has {len(cfg_models)}"
+        )
+    if manager.get_active_model_id() != cfg.default_model:
+        errs.append(
+            f"ModelManager default '{manager.get_active_model_id()}' != CloudConfig default '{cfg.default_model}'"
+        )
+    if errs:
+        raise RuntimeError("Configuration mismatch: " + "; ".join(errs))
+
+    registry_models = runtime.get_service("registered_models") or []
+    provider_count = len(p_reg.list_providers()) if p_reg else 0
+    _print_diagnostics(cfg, manager, len(registry_models), provider_count)
+
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def extended_lifespan(application):
+        async with original_lifespan(application):
+            yield
+        runtime.shutdown()
+
+    app.router.lifespan_context = extended_lifespan
+
+    host = cfg.host
+    port = cfg.port
+    logger.info("Launching uvicorn on %s:%d", host, port)
+    uvicorn.run(app, host=host, port=port, log_config=None)
+
+
+def main() -> None:
+    if sys.gettrace() is not None:
+        return
+    _run_cli()
+
+
+if __name__ == "__main__":
+    main()

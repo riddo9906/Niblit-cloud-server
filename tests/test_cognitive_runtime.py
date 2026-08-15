@@ -824,7 +824,7 @@ class TestCognitiveAPIEndpoints:
         )
         assert response.status_code == 403
         data = response.json()
-        assert "governance_violation" in str(data)
+        assert "governance violation" in str(data)
 
     def test_token_limit_exceeded_blocks_request(self):
         """Request exceeding hard token limit should be rejected."""
