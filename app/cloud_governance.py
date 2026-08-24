@@ -264,11 +264,15 @@ class CloudGovernance:
         estimated_total_tokens: int = 0,
         context_window: int = _MAX_CONTEXT_TOKENS,
     ) -> None:
+        # Governance policy: an oversized ``max_tokens`` is CLAMPED to this
+        # ceiling, not rejected. Coding agents legitimately advertise large
+        # output budgets; ModelManager additionally clamps to the true context
+        # budget. The clamp is recorded so callers can observe it.
         if max_tokens > _MAX_TOKENS:
-            violated.append(GUARD_TOKEN_LIMIT)
             rationale["token_limit"] = {
                 "requested": max_tokens,
-                "hard_limit": _MAX_TOKENS,
+                "clamped_to": _MAX_TOKENS,
+                "action": "clamped",
             }
         total_cap = min(_MAX_CONTEXT_TOKENS, context_window)
         if estimated_total_tokens > total_cap:

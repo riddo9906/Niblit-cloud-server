@@ -241,12 +241,21 @@ class TestCloudGovernance:
         assert verdict.allowed
 
     def test_token_limit_exceeded_blocks(self):
-        from app.cloud_governance import GUARD_TOKEN_LIMIT, CloudGovernance
+        """Policy update: oversized max_tokens is CLAMPED, not rejected.
+
+        Coding agents legitimately advertise large output budgets. Governance
+        records the clamp in rationale; ModelManager additionally clamps to
+        the real context budget, and estimated_total_tokens above the context
+        cap remains a hard block (GUARD_RUNAWAY_TOKENS).
+        """
+        from app.cloud_governance import CloudGovernance
 
         gov = CloudGovernance()
         verdict = gov.validate(action="chat_inference", max_tokens=99999)
-        assert not verdict.allowed
-        assert GUARD_TOKEN_LIMIT in verdict.violated
+        assert verdict.allowed
+        token_rationale = verdict.rationale.get("token_limit") or {}
+        assert token_rationale.get("action") == "clamped"
+        assert token_rationale.get("clamped_to") == 8192
 
     def test_prompt_injection_blocked(self):
         from app.cloud_governance import GUARD_PROMPT_INJECTION, CloudGovernance

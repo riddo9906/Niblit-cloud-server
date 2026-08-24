@@ -57,8 +57,11 @@ class CloudConfig:
     rope_freq_scale: float | None = None
 
     # ── Host / port ───────────────────────────────────────────────────────────
+    # ``host`` is the SERVER BIND address (0.0.0.0 is valid here). It must
+    # never be used as a client destination — see ``client_base_url``.
     host: str = "0.0.0.0"
     port: int = 8000
+    client_base_url: str = ""
 
     # ── Storage ──────────────────────────────────────────────────────────────
     storage_root: str = ""
@@ -169,8 +172,9 @@ class CloudConfig:
             ),
             rope_freq_base=_get_float("NIBLIT_ROPE_FREQ_BASE", "", None),
             rope_freq_scale=_get_float("NIBLIT_ROPE_FREQ_SCALE", "", None),
-            host=_get_str("NIBLIT_HOST", "0.0.0.0"),
+            host=_get_str("NIBLIT_CLOUD_BIND_HOST", "") or _get_str("NIBLIT_HOST", "0.0.0.0"),
             port=_get_int("NIBLIT_PORT", "", 8000),
+            client_base_url=_get_str("NIBLIT_CLOUD_BASE_URL", ""),
             storage_root=_get_str("NIBLIT_STORAGE_ROOT", ""),
             ollama_base_url=_get_str("OLLAMA_BASE_URL", "http://localhost:11434"),
             openai_api_base=_get_str("OPENAI_API_BASE", ""),
@@ -184,7 +188,9 @@ class CloudConfig:
             qwen_model_path=_get_str("NIBLIT_MODEL_PATH", "") or _get_str("NIBLIT_DEFAULT_MODEL_PATH", ""),
             qwen_backend_bin=_get_str("NIBLIT_LLAMA_SERVER_BIN", ""),
             qwen_host=_get_str("NIBLIT_HOST", "127.0.0.1"),
-            qwen_port=_get_int("NIBLIT_PORT", "", 8000),
+            # The managed qwen backend MUST NOT default to the same port as
+            # this API process — use a dedicated port unless explicitly set.
+            qwen_port=_get_int("NIBLIT_QWEN_PORT", "", 8081),
             qwen_n_ctx=_get_int("NIBLIT_N_CTX", "", 32768),
             qwen_n_threads=_get_int("NIBLIT_N_THREADS", "", 8),
             qwen_n_gpu_layers=_get_int("NIBLIT_N_GPU_LAYERS", "", 35),
@@ -194,6 +200,26 @@ class CloudConfig:
         return config
 
     # ── Convenience properties ────────────────────────────────────────────────
+
+    @property
+    def client_base_url_resolved(self) -> str:
+        """Client-usable server root — NEVER the bind address.
+
+        ``0.0.0.0`` is a valid bind but an invalid destination; local clients
+        must use ``127.0.0.1`` (or an explicit override).
+        """
+        from app.base_urls import normalize_server_root
+
+        if self.client_base_url:
+            return normalize_server_root(self.client_base_url)
+        return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def openai_base_url(self) -> str:
+        """OpenAI-compatible client base, e.g. ``http://127.0.0.1:8000/v1``."""
+        from app.base_urls import normalize_openai_base_url
+
+        return normalize_openai_base_url(self.client_base_url_resolved)
 
     @property
     def model_map(self) -> dict[str, str]:

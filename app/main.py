@@ -14,6 +14,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.cursor_gateway import _detail_to_message, get_cursor_gateway, openai_error_body
+from app import local_models
+from app.local_models import is_known_alias
+from app.memory_proposals import MemoryProposal  # noqa: F401  (prep interface)
+from app.agent_team import route_task, check_delegation_allowed  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +264,14 @@ class ModelManager:
         self._default_model = default_model or (next(iter(model_map), None))
         self._config = config
         self._engines: dict[str, GGUFEngine] = {}
+        # Per-model RUNTIME context limits (tokens). Defaults to the global
+        # n_ctx; overridden per model by the local GGUF registry so every model
+        # gets its own realistic budget instead of a blanket 16384.
+        self._model_context_limits: dict[str, int] = {}
+        # Eager resident model ids kept loaded (primary) to avoid reload hot path.
+        self._resident_models: set[str] = set()
+        # last_used (loading-epoch seconds) per model for truthful residency reporting.
+        self._model_last_used: dict[str, float] = {}
         if config is not None:
             self._n_ctx = config.n_ctx
             self._n_threads = config.n_threads
@@ -331,6 +343,64 @@ class ModelManager:
             model_path = self._model_map.get(model_id, "") if model_id else ""
         return {"model_id": model_id, "model_path": model_path}
 
+    def configure_local_specs(self, specs: dict[str, object]) -> None:
+        """Adopt per-model runtime contexts + residency from the local registry.
+
+        ``specs`` is the LocalModelSpec dict (id -> spec) from
+        ``app.local_models.discover_local_models()``.
+        """
+        with self._lock:
+            for mid, spec in specs.items():
+                ctx = getattr(spec, "runtime_context_limit", 0) or self._n_ctx
+                self._model_context_limits[mid] = max(256, int(ctx))
+                if getattr(spec, "recommended_role", "") == "primary":
+                    self._resident_models.add(mid)
+                self._model_map.setdefault(mid, getattr(spec, "path", ""))
+            if self._default_model not in self._model_map and self._model_map:
+                self._default_model = next(iter(self._model_map), None)
+            logger.info(
+                "Local specs: contexts=%s resident=%s",
+                {k: v for k, v in self._model_context_limits.items()},
+                sorted(self._resident_models),
+            )
+
+    def model_context_limit(self, model_id: str) -> int:
+        with self._lock:
+            return max(256, int(self._model_context_limits.get(model_id, self._n_ctx)))
+
+    def model_residency_info(self, model_id: str) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "available": model_id in self._model_map,
+                "loaded": model_id in self._engines,
+                "resident": model_id in self._resident_models,
+                "last_used": self._model_last_used.get(model_id),
+            }
+
+    def resolve_model_id(self, request_model: str | None, path_model: str | None) -> str:
+        with self._lock:
+            default = self._default_model
+            model_keys = set(self._model_map.keys())
+        model_id = request_model or path_model or default
+        if not model_id:
+            raise HTTPException(status_code=400, detail="No model provided.")
+        # Known canonical model -> exact.
+        if model_id in model_keys:
+            return model_id
+        # Truthful alias resolution (llama3 -> llama3.2-1b, never Qwen).
+        alias_target = (
+            local_models.resolve_alias(model_id)
+            if model_id not in model_keys
+            else model_id
+        )
+        if alias_target in model_keys:
+            return alias_target
+        if is_known_alias(model_id):
+            # Alias known but its target model file is missing.
+            raise HTTPException(status_code=404, detail=f"Alias '{model_id}' resolved to unavailable model '{alias_target}'.")
+        # Explicit unknown model -> clean model_not_found (never silently default).
+        raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+
     def get_active_model_id(self) -> str | None:
         with self._lock:
             return self._default_model
@@ -384,27 +454,6 @@ class ModelManager:
             })
         return result
 
-    def resolve_model_id(self, request_model: str | None, path_model: str | None) -> str:
-        with self._lock:
-            default = self._default_model
-        model_id = request_model or path_model or default
-        if not model_id:
-            raise HTTPException(status_code=400, detail="No model provided.")
-        raw = model_id.lower()
-        if raw in _LOCAL_MODEL_ALIASES:
-            if not default:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        f"Model alias '{model_id}' received but no default model is "
-                        "configured. Set DEFAULT_MODEL_ID and GGUF_MODELS_JSON."
-                    ),
-                )
-            return default
-        if model_id not in self._model_map:
-            raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
-        return model_id
-
     def chat(
         self, model_id: str, messages: list[dict[str, str]], temperature: float, max_tokens: int
     ) -> ModelEngineResult:
@@ -412,12 +461,14 @@ class ModelManager:
             if model_id not in self._engines:
                 self._engines[model_id] = GGUFEngine(
                     model_path=self._model_map[model_id],
-                    n_ctx=self._n_ctx,
+                    n_ctx=self.model_context_limit(model_id),
                     n_threads=self._n_threads,
                     runtime_options=self._runtime_options,
                 )
+                self._model_last_used[model_id] = time.time()
+            self._model_last_used[model_id] = time.time()
             engine = self._engines[model_id]
-        plan = self._prepare_inference(messages=messages, max_tokens=max_tokens)
+        plan = self._prepare_inference(messages=messages, max_tokens=max_tokens, model_id=model_id)
         logger.debug(
             "chat request: model=%s messages=%d temperature=%s max_tokens=%d effective_max_tokens=%d",
             model_id, len(messages), temperature, max_tokens, plan["effective_max_tokens"],
@@ -440,8 +491,8 @@ class ModelManager:
             self._stats["last_context_usage_ratio"] = round(plan["context_usage_ratio"], 4)
         return result
 
-    def estimate_inference(self, messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:
-        return self._prepare_inference(messages=messages, max_tokens=max_tokens)
+    def estimate_inference(self, messages: list[dict[str, str]], max_tokens: int, model_id: str | None = None) -> dict[str, Any]:
+        return self._prepare_inference(messages=messages, max_tokens=max_tokens, model_id=model_id)
 
     def runtime_stats(self) -> dict[str, Any]:
         with self._lock:
@@ -464,11 +515,14 @@ class ModelManager:
             )
         return max(1, total_chars // self._char_to_token_ratio)
 
-    def _prepare_inference(self, messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:
+    def _prepare_inference(self, messages: list[dict[str, str]], max_tokens: int, model_id: str | None = None) -> dict[str, Any]:
         source_messages = [dict(m) for m in messages]
         safe_messages = [dict(m) for m in messages]
         requested_max_tokens = max(1, int(max_tokens))
-        target_ctx_budget = max(256, int(self._n_ctx * self._memory_guard_ratio))
+        # Model-specific context: use the selected model's runtime context, not
+        # a blanket global. This is the ONLY place context limits are derived.
+        ctx_limit = self.model_context_limit(model_id) if model_id else self._n_ctx
+        target_ctx_budget = max(256, int(ctx_limit * self._memory_guard_ratio))
         prompt_tokens = self._estimate_tokens(safe_messages)
         min_generation = max(16, min(self._min_generation_tokens, requested_max_tokens))
         max_prompt_budget = max(64, target_ctx_budget - max(self._context_reserve_tokens, min_generation))
@@ -498,7 +552,7 @@ class ModelManager:
                 prompt_tokens = self._estimate_tokens(safe_messages)
         available_for_generation = max(1, target_ctx_budget - prompt_tokens - self._context_reserve_tokens)
         effective_max_tokens = max(1, min(requested_max_tokens, available_for_generation))
-        context_usage_ratio = (prompt_tokens + effective_max_tokens) / max(1, self._n_ctx)
+        context_usage_ratio = (prompt_tokens + effective_max_tokens) / max(1, ctx_limit)
         memory_pressure = min(1.0, (prompt_tokens + requested_max_tokens) / max(1, target_ctx_budget))
         return {
             "messages": safe_messages,
@@ -509,6 +563,9 @@ class ModelManager:
             "context_usage_ratio": context_usage_ratio,
             "memory_pressure": memory_pressure,
             "target_ctx_budget": target_ctx_budget,
+            "model_id": model_id or self._default_model,
+            "model_context_limit": ctx_limit,
+            "available_completion_tokens": available_for_generation,
         }
 
 
@@ -545,6 +602,9 @@ class CompletionRequest(BaseModel):
     temperature: float = _DEFAULT_TEMPERATURE
     stop: list[str] | None = None
     model: str | None = None
+    # OpenAI-compatible aliases (VS Code / coding agents send these)
+    max_tokens: int | None = None
+    stream: bool = False
 
 
 class InferenceRequest(BaseModel):
@@ -667,9 +727,37 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
         return response
 
     @app.get("/healthz")
-    @app.get("/health")
-    def health() -> dict[str, str]:
+    def healthz() -> dict[str, str]:
+        """Liveness — process is up. Never reports inference state."""
         return {"status": "ok"}
+
+    @app.get("/health")
+    def health() -> JSONResponse:
+        """Readiness — truthfully reflects inference availability.
+
+        200 when at least one usable model/provider exists and the default
+        model resolves; 503 ``degraded`` with ``default_model_unavailable``
+        when boot succeeded but no usable inference path exists.
+        """
+        manager: ModelManager = app.state.model_manager
+        models = manager.list_models()
+        default_info = manager.get_default_model_info()
+        default_id = default_info.get("model_id") or None
+        usable_ids = {str(m.get("id")) for m in models if isinstance(m, dict) and m.get("id")}
+        inference_ready = bool(models) and bool(default_id) and (
+            default_id in usable_ids or len(usable_ids) > 0
+        )
+        payload: dict[str, Any] = {
+            "status": "ready" if inference_ready else "degraded",
+            "api_ready": True,
+            "inference_ready": inference_ready,
+            "default_model": default_id,
+            "models": sorted(usable_ids),
+        }
+        if not inference_ready:
+            payload["reason"] = "default_model_unavailable"
+            return JSONResponse(status_code=503, content=payload)
+        return JSONResponse(content=payload)
 
     @app.get("/props")
     def props() -> dict[str, Any]:
@@ -768,7 +856,7 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
                 engine_info[mid] = {
                     "loaded": True,
                     "model_path": manager._model_map[mid],
-                    "n_ctx": manager._n_ctx,
+                    "n_ctx": manager.model_context_limit(mid),
                     "n_threads": manager._n_threads,
                     "metadata": getattr(engine, "metadata", {}),
                 }
@@ -783,14 +871,34 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
             "default_model": manager.get_default_model_info(),
             "engines": engine_info,
             "context_runtime": manager.runtime_stats(),
+            "model_residency": {
+                mid: manager.model_residency_info(mid) for mid in manager._model_map
+            },
         }
 
-    def handle_chat(payload: ChatCompletionRequest, path_model: str | None = None) -> dict[str, Any]:
-        start_ms = time.perf_counter() * 1000
+    def _preflight_chat(
+        payload: ChatCompletionRequest, path_model: str | None = None
+    ) -> dict[str, Any]:
+        """Deterministic preflight — MUST run before any StreamingResponse.
+
+        Performs context estimation, attention allocation, governance validation
+        and model resolution. Any rejection raises a normal HTTPException so the
+        client receives a structured JSON error instead of a mid-stream failure.
+        """
         request_id = uuid.uuid4().hex
         manager: ModelManager = app.state.model_manager
         messages = _normalize_messages(payload.messages)
-        inference_plan = manager.estimate_inference(messages=messages, max_tokens=payload.max_tokens)
+        # Resolve the requested model FIRST (truthful aliases; explicit unknown
+        # -> clean model_not_found) so governance/budget use the right context.
+        resolver = getattr(manager, "resolve_model_id", None)
+        if resolver is None:
+            from app.main import ModelManager as _MM
+            resolved_model = payload.model or path_model or manager.get_default_model_info().get("model_id")
+        else:
+            resolved_model = resolver(payload.model or path_model, path_model)
+        inference_plan = manager.estimate_inference(
+            messages=messages, max_tokens=payload.max_tokens, model_id=resolved_model
+        )
         envelope = _extract_envelope(payload)
         if inference_plan["memory_pressure"] >= 0.85:
             envelope["resource_mode"] = "conservative"
@@ -824,12 +932,17 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
                     action="chat_inference",
                     context={
                         "prompt_tokens_estimate": inference_plan["prompt_tokens_estimate"],
-                        "estimated_total_tokens": inference_plan["prompt_tokens_estimate"] + payload.max_tokens,
-                        "context_window": manager.runtime_stats().get("context_window"),
+                        # Pass the RAW requested max_tokens so governance can see
+                        # the true request size (for clamp/rejection logging) while
+                        # the effective clamped value is used for actual inference.
+                        "requested_max_tokens": int(payload.max_tokens),
+                        "effective_max_tokens": inference_plan["effective_max_tokens"],
+                        "estimated_total_tokens": int(payload.max_tokens) + inference_plan["prompt_tokens_estimate"],
+                        "context_window": inference_plan["model_context_limit"],
                     },
                     envelope=envelope,
                     messages=messages,
-                    max_tokens=payload.max_tokens,
+                    max_tokens=int(payload.max_tokens),
                 )
                 if not verdict.allowed:
                     governance_vetoed = True
@@ -855,7 +968,7 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
             except Exception:
                 pass
         available_models = list(manager._model_map.keys())
-        request_model_id = manager.resolve_model_id(payload.model, path_model)
+        request_model_id = resolved_model
         if _orchestrator_mod and len(available_models) > 1:
             try:
                 decision = _orchestrator_mod.get_model_orchestrator().route(
@@ -867,11 +980,44 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
                     request_model_id = decision.model_id
             except Exception:
                 pass
+        return {
+            "request_id": request_id,
+            "manager": manager,
+            "messages": messages,
+            "inference_plan": inference_plan,
+            "envelope": envelope,
+            "allocation": allocation,
+            "governance_vetoed": governance_vetoed,
+            "model_id": request_model_id,
+            # Governance clamp: ceiling on completion tokens for this request.
+            "effective_max_tokens": min(
+                int(payload.max_tokens),
+                int(getattr(_governance_mod.get_cloud_governance(), "status", lambda: {})().get(
+                    "max_tokens_limit", 8192
+                ) if _governance_mod else 8192),
+            ),
+        }
+
+    def handle_chat(
+        payload: ChatCompletionRequest,
+        path_model: str | None = None,
+        preflight: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        start_ms = time.perf_counter() * 1000
+        pre = preflight if preflight is not None else _preflight_chat(payload, path_model)
+        request_id = pre["request_id"]
+        manager: ModelManager = pre["manager"]
+        messages = pre["messages"]
+        inference_plan = pre["inference_plan"]
+        envelope = pre["envelope"]
+        allocation = pre["allocation"]
+        governance_vetoed = pre["governance_vetoed"]
+        request_model_id = pre["model_id"]
         result = manager.chat(
             model_id=request_model_id,
             messages=messages,
             temperature=payload.temperature,
-            max_tokens=payload.max_tokens,
+            max_tokens=pre.get("effective_max_tokens", payload.max_tokens),
         )
         end_ms = time.perf_counter() * 1000
         latency_ms = end_ms - start_ms
@@ -920,9 +1066,14 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
         return response
 
     def stream_chat_completion(
-        payload: ChatCompletionRequest, path_model: str | None = None
+        payload: ChatCompletionRequest,
+        path_model: str | None = None,
+        preflight: dict[str, Any] | None = None,
     ) -> Generator[str, None, None]:
-        response = handle_chat(payload, path_model)
+        # ``preflight`` MUST have been evaluated eagerly by the route handler
+        # before StreamingResponse was constructed, so governance/context
+        # rejections surface as normal JSON errors — never mid-stream.
+        response = handle_chat(payload, path_model, preflight=preflight)
         model_id = str(response.get("model", payload.model or ""))
         choice = ((response.get("choices") or [{}])[0]) if isinstance(response, dict) else {}
         message = choice.get("message") if isinstance(choice, dict) else {}
@@ -966,9 +1117,14 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
         start = _cursor_gateway.log_incoming(request, path="/v1/chat/completions", model=model)
         try:
             if adapted.stream:
+                # Eager deterministic preflight BEFORE constructing the
+                # StreamingResponse: governance/context/attention rejections
+                # must surface as structured JSON errors, never as mid-stream
+                # "response already started" failures.
+                stream_preflight = _preflight_chat(adapted, path_model)
                 return StreamingResponse(
                     _cursor_gateway.wrap_stream(
-                        stream_chat_completion(adapted, path_model),
+                        stream_chat_completion(adapted, path_model, preflight=stream_preflight),
                         start=start, model=model, ctx=gw_ctx,
                     ),
                     media_type="text/event-stream",
@@ -992,6 +1148,81 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
             temperature=payload.temperature, max_tokens=payload.n_predict,
         )
         return {"content": result.text}
+
+    @app.post("/v1/completions")
+    @app.post("/completions")
+    def openai_completions(payload: CompletionRequest, request: Request) -> Any:
+        """OpenAI-compatible legacy completions endpoint.
+
+        Routed through the SAME authoritative preflight + ModelManager path as
+        ``/v1/chat/completions`` — no second inference engine. Supports
+        ``model``/``max_tokens``/``temperature``/``stream``.
+        """
+        max_tokens = payload.max_tokens if payload.max_tokens is not None else payload.n_predict
+        chat_payload = ChatCompletionRequest(
+            model=payload.model,
+            messages=[{"role": "user", "content": payload.prompt}],
+            temperature=payload.temperature,
+            max_tokens=max_tokens,
+            stream=payload.stream,
+        )
+        model = _cursor_gateway.resolve_request_model(chat_payload, None)
+        start = _cursor_gateway.log_incoming(request, path="/v1/completions", model=model)
+        try:
+            if payload.stream:
+                # Eager preflight before StreamingResponse (same contract as
+                # chat streaming): governed rejections stay clean JSON errors.
+                stream_preflight = _preflight_chat(chat_payload, None)
+
+                def _completion_stream() -> Generator[str, None, None]:
+                    response = handle_chat(chat_payload, None, preflight=stream_preflight)
+                    choice = ((response.get("choices") or [{}])[0]) if isinstance(response, dict) else {}
+                    message = choice.get("message") if isinstance(choice, dict) else {}
+                    text = message.get("content", "") if isinstance(message, dict) else ""
+                    completion_id = f"cmpl-{uuid.uuid4().hex}"
+                    created_ts = int(time.time())
+                    first = {
+                        "id": completion_id,
+                        "object": "text_completion.chunk",
+                        "created": created_ts,
+                        "model": response.get("model", model or ""),
+                        "choices": [{"text": text, "index": 0, "finish_reason": None}],
+                    }
+                    final = {
+                        "id": completion_id,
+                        "object": "text_completion.chunk",
+                        "created": created_ts,
+                        "model": response.get("model", model or ""),
+                        "choices": [{"text": "", "index": 0, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(first)}\n\n"
+                    yield f"data: {json.dumps(final)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    _cursor_gateway.wrap_stream(
+                        _completion_stream(), start=start, model=model, ctx=None
+                    ),
+                    media_type="text/event-stream",
+                    headers=_cursor_gateway.stream_headers,
+                )
+
+            preflight = _preflight_chat(chat_payload, None)
+            response = handle_chat(chat_payload, None, preflight=preflight)
+            choice = ((response.get("choices") or [{}])[0]) if isinstance(response, dict) else {}
+            message = choice.get("message") if isinstance(choice, dict) else {}
+            text = message.get("content", "") if isinstance(message, dict) else ""
+            return {
+                "id": f"cmpl-{uuid.uuid4().hex}",
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": response.get("model", model or ""),
+                "choices": [{"text": text, "index": 0, "finish_reason": "stop"}],
+                # Real usage from the engine — never fabricated.
+                "usage": response.get("usage") or {},
+            }
+        except HTTPException:
+            raise
 
     @app.post("/models/{path_model}")
     def inference_api(path_model: str, payload: InferenceRequest) -> dict[str, Any]:
@@ -1317,7 +1548,10 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
             "topology": {},
         }
         try:
-            diagnostics["runtime_health"] = 1.0 if health().get("status") == "ok" else 0.0
+            # ``health`` returns a JSONResponse, not a dictionary. Use its
+            # HTTP status so diagnostics does not call ``.get`` on the
+            # response object (and so readiness remains truthful).
+            diagnostics["runtime_health"] = 1.0 if health().status_code == 200 else 0.0
         except Exception:
             diagnostics["runtime_health"] = 0.0
         if _attention_mod:
@@ -1660,7 +1894,8 @@ def _print_diagnostics(config: Any, manager: Any, registry_count: int, provider_
             print(f"  Alias: {alias} -> {config.default_model}", flush=True)
     else:
         print("  Aliases: (no default model configured)", flush=True)
-    print(f"  API: http://{config.host}:{config.port}", flush=True)
+    print(f"  API: {config.client_base_url_resolved}  (OpenAI base: {config.openai_base_url})", flush=True)
+    print(f"  Bind: {config.host}:{config.port}", flush=True)
     print(flush=True)
 
 
@@ -1679,8 +1914,8 @@ def _run_cli() -> None:
 
     runtime = CloudRuntime(config=cfg)
     ready = runtime.run()
-    status = "READY" if ready else "DEGRADED"
-    print(f"\nCloud {status}\n", flush=True)
+    api_status = "API READY" if ready else "API DEGRADED"
+    print(f"\nCloud {api_status}\n", flush=True)
     for stage in runtime.stages:
         print(
             f"  [{stage.stage.value}] {stage.status} ({stage.duration_ms:.1f} ms): {stage.message}",
@@ -1695,6 +1930,29 @@ def _run_cli() -> None:
         from app.main import ModelManager as _MM
         manager = _MM(cfg.model_map, cfg.default_model, config=cfg)
         app.state.model_manager = manager
+
+    # Adopt the authoritative local GGUF registry: per-model contexts,
+    # residency, truthful roles. Fallback to the configured model_map when no
+    # local specs are discovered (e.g. a pre-wired remote-only config).
+    try:
+        from app.local_models import discover_local_models
+        local_specs = discover_local_models()
+        if local_specs and hasattr(manager, "configure_local_specs"):
+            manager.configure_local_specs(local_specs)
+    except Exception as exc:
+        logger.warning("Local GGUF spec adoption failed: %s", exc)
+
+    # Truthful inference readiness — never imply a usable model exists when
+    # only the HTTP layer booted.
+    try:
+        _models = manager.list_models()
+        _default_id = (manager.get_default_model_info() or {}).get("model_id")
+        if _models and _default_id:
+            print(f"Inference READY — default model: {_default_id}\n", flush=True)
+        else:
+            print("Inference DEGRADED — default model unavailable\n", flush=True)
+    except Exception:
+        pass
 
     registry = runtime.get_service("model_registry")
     if registry is not None:
@@ -1717,16 +1975,37 @@ def _run_cli() -> None:
     cfg_models = cfg.model_map
     mm_models = manager.list_models() if manager else []
     errs = []
-    if len(mm_models) != len(cfg_models):
+
+    # CloudConfig describes configured models. ModelManager is the
+    # executable runtime inventory and may contain additional models.
+    cfg_model_ids = set(cfg_models.keys())
+    mm_model_ids = {
+        str(model.get("id"))
+        for model in mm_models
+        if isinstance(model, dict) and model.get("id")
+    }
+
+    missing_configured_models = sorted(
+        cfg_model_ids - mm_model_ids
+    )
+
+    if missing_configured_models:
         errs.append(
-            f"ModelManager sees {len(mm_models)} models but CloudConfig has {len(cfg_models)}"
+            "ModelManager is missing configured model(s): "
+            + ", ".join(missing_configured_models)
         )
-    if manager.get_active_model_id() != cfg.default_model:
+
+    active_model_id = manager.get_active_model_id()
+    if active_model_id != cfg.default_model:
         errs.append(
-            f"ModelManager default '{manager.get_active_model_id()}' != CloudConfig default '{cfg.default_model}'"
+            f"ModelManager default '{active_model_id}' "
+            f"!= CloudConfig default '{cfg.default_model}'"
         )
+
     if errs:
-        raise RuntimeError("Configuration mismatch: " + "; ".join(errs))
+        raise RuntimeError(
+            "Configuration mismatch: " + "; ".join(errs)
+        )
 
     registry_models = runtime.get_service("registered_models") or []
     provider_count = len(p_reg.list_providers()) if p_reg else 0

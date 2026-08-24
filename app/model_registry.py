@@ -152,14 +152,16 @@ class ModelRegistry:
                 capabilities=ModelCapabilities(chat=True, vision=True, tools=True, streaming=True),
             ))
 
-        # Ollama
-        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
-        self.register(RegisteredModel(
-            name="ollama/llama3",
-            provider=ProviderType.OLLAMA,
-            context=8192,
-            metadata={"base_url": ollama_url},
-        ))
+        # Ollama — discover ACTUAL models from the live daemon instead of
+        # advertising a hardcoded ID that may not exist.
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
+        for model_id in _discover_ollama_models(ollama_url):
+            self.register(RegisteredModel(
+                name=model_id,
+                provider=ProviderType.OLLAMA,
+                context=8192,
+                metadata={"base_url": ollama_url},
+            ))
 
         # vLLM
         vllm_url = os.getenv("VLLM_API_BASE", "").strip()
@@ -182,6 +184,33 @@ class ModelRegistry:
             ))
 
         logger.info("Discovered %d models from environment", len(self._models))
+
+
+def _discover_ollama_models(base_url: str, timeout: float = 1.5) -> list[str]:
+    """Query a live Ollama daemon for its actual model list.
+
+    Returns real model IDs (e.g. ``qwen3:8B``). Never fabricates entries;
+    an unreachable daemon yields an empty list.
+    """
+    if not base_url:
+        return []
+    import json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{base_url}/api/tags", timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+        models = payload.get("models") if isinstance(payload, dict) else None
+        out: list[str] = []
+        for entry in models or []:
+            name = str((entry or {}).get("name") or "").strip()
+            if name:
+                out.append(name)
+        logger.info("Ollama discovery at %s: %d model(s)", base_url, len(out))
+        return out
+    except Exception as exc:
+        logger.info("Ollama discovery failed at %s: %s", base_url, exc)
+        return []
 
 
 def get_model_registry() -> ModelRegistry:
