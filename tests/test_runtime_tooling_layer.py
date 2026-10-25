@@ -530,7 +530,7 @@ class TestBackwardCompatibility:
                     default_model="demo",
                 )
 
-            def chat(self, model_id, messages, temperature, max_tokens):
+            def chat(self, model_id, messages, temperature, max_tokens, **kwargs):
                 return ModelEngineResult(
                     text="ok",
                     finish_reason="stop",
@@ -671,3 +671,4 @@ class TestTunnelParsing:
         os.environ["NIBLIT_TUNNEL_PUBLIC_URL"] = url
         assert os.environ.get("NIBLIT_TUNNEL_PUBLIC_URL") == url
         del os.environ["NIBLIT_TUNNEL_PUBLIC_URL"]
+

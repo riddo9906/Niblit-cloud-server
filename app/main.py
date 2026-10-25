@@ -7,10 +7,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Generator
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.cursor_gateway import _detail_to_message, get_cursor_gateway, openai_error_body
@@ -54,6 +56,8 @@ class ModelEngineResult:
     text: str
     finish_reason: str = "stop"
     usage: dict[str, int] | None = None
+    # Structured OpenAI-style tool_calls emitted by the model, if any.
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class GGUFEngine:
@@ -181,15 +185,17 @@ class GGUFEngine:
             )
 
     def chat(
-        self, messages: list[dict[str, str]], temperature: float, max_tokens: int
+        self, messages: list[dict[str, str]], temperature: float, max_tokens: int,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
     ) -> ModelEngineResult:
         self.validate_prompt(messages, max_tokens)
 
-        safe_messages: list[dict[str, str]] = []
+        safe_messages: list[dict[str, Any]] = []
         for msg in messages:
             safe_messages.append({
                 "role": str(msg.get("role", "user")).strip(),
-                "content": str(msg.get("content", " ")).strip() or " ",
+                "content": msg.get("content") if msg.get("content") is not None else " ",
             })
 
         logger.info(
@@ -203,12 +209,22 @@ class GGUFEngine:
         # concurrent native access that causes llama_decode returned -1
         # and GGML_ASSERT failures.
         with self._lock:
+            # OpenAI tool-calling passthrough: forward schemas to llama.cpp
+            # (supported by qwen/llama chat templates). Only include when the
+            # caller supplied them so normal chat payloads are untouched.
+            completion_kwargs: dict[str, Any] = {
+                "messages": safe_messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": False,
+            }
+            if tools:
+                completion_kwargs["tools"] = tools
+                if tool_choice is not None:
+                    completion_kwargs["tool_choice"] = tool_choice
             try:
                 response = self._llm.create_chat_completion(
-                messages=safe_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=False,
+                **completion_kwargs,
             )
             except RuntimeError as exc:
                 exc_str = str(exc)
@@ -247,14 +263,51 @@ class GGUFEngine:
             choice = choices[0]
             message = choice.get("message") if isinstance(choice, dict) else None
             text = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(text, str):
+            engine_tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+            if not engine_tool_calls and tools:
+                # Some local GGUF chat templates emit the tool invocation as
+                # fenced/plain JSON in content instead of native tool_calls.
+                # Promote it deterministically (only when the name matches a
+                # supplied tool) so callers get a uniform structured contract.
+                import json as _json
+                import re as _re
+                raw = (text or "").strip()
+                m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, _re.S) or (
+                    _re.match(r"\{.*\}", raw, _re.S) if raw.startswith("{") else None)
+                if m:
+                    try:
+                        # The fenced alternative has a capturing group; the
+                        # bare-JSON alternative does not (Phase 5B fix: bare
+                        # content used to raise IndexError -> HTTP 500).
+                        obj = _json.loads(m.group(1) if m.groups()
+                                          else m.group(0))
+                        name = obj.get("name")
+                        known = {t.get("function", {}).get("name") for t in tools}
+                        if name in known:
+                            engine_tool_calls = [{
+                                "id": f"call_{uuid.uuid4().hex[:8]}",
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": _json.dumps(obj.get("arguments", obj.get("args", {}))),
+                                },
+                            }]
+                            logger.info("Promoted text tool-call to structured: %s", name)
+                    except (ValueError, AttributeError, IndexError):
+                        pass
+            if not isinstance(text, str) and not engine_tool_calls:
                 raise HTTPException(status_code=502, detail={"error": "invalid_response", "message": "message.content must be a string."})
             usage = response.get("usage")
-            logger.info("Inference OK: finish=%s tokens=%s", choice.get("finish_reason"), usage.get("total_tokens") if usage else "?")
+            logger.info(
+                "Inference OK: finish=%s tokens=%s tool_calls=%d",
+                choice.get("finish_reason"), usage.get("total_tokens") if usage else "?",
+                len(engine_tool_calls) if isinstance(engine_tool_calls, list) else 0,
+            )
             return ModelEngineResult(
-                text=text,
+                text=text or "",
                 finish_reason=choice.get("finish_reason", "stop"),
                 usage=usage,
+                tool_calls=engine_tool_calls if isinstance(engine_tool_calls, list) else None,
             )
 
 
@@ -455,13 +508,20 @@ class ModelManager:
         return result
 
     def chat(
-        self, model_id: str, messages: list[dict[str, str]], temperature: float, max_tokens: int
+        self, model_id: str, messages: list[dict[str, str]], temperature: float, max_tokens: int,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
     ) -> ModelEngineResult:
+        # Resolve the per-model context limit BEFORE taking the manager lock.
+        # model_context_limit() acquires the same non-reentrant threading.Lock,
+        # so calling it inside the critical section below self-deadlocked
+        # every cold-engine request (the "inference hang").
+        ctx_limit = self.model_context_limit(model_id)
         with self._lock:
             if model_id not in self._engines:
                 self._engines[model_id] = GGUFEngine(
                     model_path=self._model_map[model_id],
-                    n_ctx=self.model_context_limit(model_id),
+                    n_ctx=ctx_limit,
                     n_threads=self._n_threads,
                     runtime_options=self._runtime_options,
                 )
@@ -475,7 +535,8 @@ class ModelManager:
         )
         try:
             result = engine.chat(
-                messages=plan["messages"], temperature=temperature, max_tokens=plan["effective_max_tokens"]
+                messages=plan["messages"], temperature=temperature, max_tokens=plan["effective_max_tokens"],
+                tools=tools, tool_choice=tool_choice,
             )
         except (RuntimeError, ValueError, MemoryError) as exc:
             logger.error("Inference error for model %s: %s", model_id, exc)
@@ -628,6 +689,9 @@ def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 def _build_chat_response(model_id: str, result: ModelEngineResult) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": result.text}
+    if result.tool_calls:
+        message["tool_calls"] = result.tool_calls
     payload: dict[str, Any] = {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -636,8 +700,8 @@ def _build_chat_response(model_id: str, result: ModelEngineResult) -> dict[str, 
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": result.text},
-                "finish_reason": result.finish_reason,
+                "message": message,
+                "finish_reason": "tool_calls" if result.tool_calls else result.finish_reason,
             }
         ],
     }
@@ -693,6 +757,12 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
     app.state.model_manager = _manager
     app.state.cloud_config = config
     _cursor_gateway = get_cursor_gateway()
+    cloud_ui_dir = Path(__file__).parent / "static" / "cloud_ui"
+    app.mount("/ui", StaticFiles(directory=cloud_ui_dir), name="cloud-ui")
+
+    @app.get("/", include_in_schema=False)
+    def cloud_ui() -> FileResponse:
+        return FileResponse(cloud_ui_dir / "index.html")
 
     @app.exception_handler(HTTPException)
     async def openai_http_exception_handler(request: Request, exc: HTTPException):
@@ -887,18 +957,25 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
         """
         request_id = uuid.uuid4().hex
         manager: ModelManager = app.state.model_manager
+        logger.debug("preflight[%s] start", request_id)
         messages = _normalize_messages(payload.messages)
         # Resolve the requested model FIRST (truthful aliases; explicit unknown
         # -> clean model_not_found) so governance/budget use the right context.
         resolver = getattr(manager, "resolve_model_id", None)
+        # An explicitly requested model (body or path) must not be silently
+        # overridden by orchestrator latency-based rerouting later in
+        # preflight: the caller asked for a specific model.
+        explicit_selection = bool(payload.model or path_model)
         if resolver is None:
             from app.main import ModelManager as _MM
             resolved_model = payload.model or path_model or manager.get_default_model_info().get("model_id")
         else:
             resolved_model = resolver(payload.model or path_model, path_model)
+        logger.debug("preflight[%s] resolved model=%s", request_id, resolved_model)
         inference_plan = manager.estimate_inference(
             messages=messages, max_tokens=payload.max_tokens, model_id=resolved_model
         )
+        logger.debug("preflight[%s] estimated prompt=%s", request_id, inference_plan["prompt_tokens_estimate"])
         envelope = _extract_envelope(payload)
         if inference_plan["memory_pressure"] >= 0.85:
             envelope["resource_mode"] = "conservative"
@@ -908,6 +985,7 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
             envelope["runtime"] = runtime_ctx
         allocation = None
         if _attention_mod:
+            logger.debug("preflight[%s] attention start", request_id)
             try:
                 allocation = _attention_mod.get_attention_allocator().score_request(
                     request_id, envelope=envelope
@@ -925,8 +1003,10 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
                 raise
             except Exception:
                 pass
+            logger.debug("preflight[%s] attention done", request_id)
         governance_vetoed = False
         if _governance_mod:
+            logger.debug("preflight[%s] governance start", request_id)
             try:
                 verdict = _governance_mod.get_cloud_governance().validate(
                     action="chat_inference",
@@ -959,6 +1039,7 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
                 raise
             except Exception:
                 pass
+            logger.debug("preflight[%s] governance done", request_id)
         if _temporal_mod:
             try:
                 _temporal_mod.get_temporal_sync().record_request(
@@ -969,7 +1050,7 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
                 pass
         available_models = list(manager._model_map.keys())
         request_model_id = resolved_model
-        if _orchestrator_mod and len(available_models) > 1:
+        if _orchestrator_mod and len(available_models) > 1 and not explicit_selection:
             try:
                 decision = _orchestrator_mod.get_model_orchestrator().route(
                     available_models=available_models,
@@ -989,6 +1070,8 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
             "allocation": allocation,
             "governance_vetoed": governance_vetoed,
             "model_id": request_model_id,
+            # resolved model before any orchestrator rerouting
+            "resolved_model": resolved_model,
             # Governance clamp: ceiling on completion tokens for this request.
             "effective_max_tokens": min(
                 int(payload.max_tokens),
@@ -1018,6 +1101,8 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
             messages=messages,
             temperature=payload.temperature,
             max_tokens=pre.get("effective_max_tokens", payload.max_tokens),
+            tools=payload.tools,
+            tool_choice=payload.tool_choice,
         )
         end_ms = time.perf_counter() * 1000
         latency_ms = end_ms - start_ms
@@ -1049,6 +1134,17 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
             except Exception:
                 pass
         response = _build_chat_response(request_model_id, result)
+        # Model-identity provenance: requested vs resolved vs executed.
+        # The executed model is authoritative (it is what ModelManager ran);
+        # fallback is only true when resolution changed the caller's request.
+        requested_raw = payload.model or path_model
+        response["niblit_model"] = {
+            "request_id": request_id,
+            "requested_model": requested_raw,
+            "resolved_model": pre.get("resolved_model") if requested_raw else None,
+            "executed_model": request_model_id,
+            "fallback": bool(requested_raw) and request_model_id != requested_raw,
+        }
         if envelope.get("intent"):
             response["cognitive"] = {
                 "request_id": request_id,
@@ -1096,6 +1192,10 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
         }
         yield f"data: {json.dumps(first)}\n\n"
         yield f"data: {json.dumps(final)}\n\n"
+        # Non-OpenAI extension frame carrying authoritative execution metadata
+        # so streaming clients can surface Selected vs Executed truthfully.
+        if isinstance(response, dict) and response.get("niblit_model"):
+            yield f"data: {json.dumps({'niblit_model': response['niblit_model']})}\n\n"
         yield "data: [DONE]\n\n"
 
     @app.post("/v1/chat/completions")
@@ -1996,7 +2096,9 @@ def _run_cli() -> None:
         )
 
     active_model_id = manager.get_active_model_id()
-    if active_model_id != cfg.default_model:
+    # Local discovery can select a default when no model was configured.
+    # Only enforce equality when the config actually specifies a default.
+    if cfg.default_model is not None and active_model_id != cfg.default_model:
         errs.append(
             f"ModelManager default '{active_model_id}' "
             f"!= CloudConfig default '{cfg.default_model}'"

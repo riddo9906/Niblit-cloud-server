@@ -24,6 +24,7 @@ def client(monkeypatch) -> TestClient:
             self.text = "OK"
             self.finish_reason = "stop"
             self.usage = {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+            self.tool_calls = None
 
     class FakeManager:
         def __init__(self) -> None:
@@ -58,7 +59,7 @@ def client(monkeypatch) -> TestClient:
         def runtime_stats(self):
             return {"context_window": 16384}
 
-        def chat(self, model_id, messages, temperature, max_tokens):
+        def chat(self, model_id, messages, temperature, max_tokens, **kwargs):
             self.last_max_tokens = max_tokens
             return FakeResult()
 
@@ -231,3 +232,5 @@ def test_missing_max_tokens_uses_default(client) -> None:
         },
     )
     assert resp.status_code == 200
+
+

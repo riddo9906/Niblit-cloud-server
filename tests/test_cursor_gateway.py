@@ -22,7 +22,7 @@ class FakeModelManager(ModelManager):
         )
         self.last_chat_call = None
 
-    def chat(self, model_id, messages, temperature, max_tokens):
+    def chat(self, model_id, messages, temperature, max_tokens, **kwargs):
         self.last_chat_call = {
             "model_id": model_id,
             "messages": messages,
@@ -265,3 +265,4 @@ def test_gateway_disabled_skips_model_enrichment(monkeypatch):
     assert gateway.enabled is False
     raw = {"object": "list", "data": [{"id": "x", "object": "model"}]}
     assert gateway.adapt_models_response(raw) == raw
+

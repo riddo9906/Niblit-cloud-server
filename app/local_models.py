@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_GGUF_DIR = r"C:\Users\Riyaad\llama_migration\models"
+# Keep the development default relative to the current user profile while
+# allowing packaged deployments to set NIBLIT_GGUF_MODEL_DIR explicitly.
+DEFAULT_GGUF_DIR = str(Path.home() / "llama_migration" / "models")
 
 PRIMARY_MODEL_ID = "qwen2.5-coder-3b"
 SUMMARIZER_MODEL_ID = "llama3.2-1b"

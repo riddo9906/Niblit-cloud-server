@@ -12,7 +12,7 @@ class FakeModelManager(ModelManager):
         )
         self.last_chat_call = None
 
-    def chat(self, model_id, messages, temperature, max_tokens):
+    def chat(self, model_id, messages, temperature, max_tokens, **kwargs):
         if not messages:
             raise AssertionError("messages must not be empty in tests")
         self.last_chat_call = {
@@ -261,7 +261,7 @@ class TwoModelManager(ModelManager):
         )
         self.last_chat_call = None
 
-    def chat(self, model_id, messages, temperature, max_tokens):
+    def chat(self, model_id, messages, temperature, max_tokens, **kwargs):
         self.last_chat_call = {"model_id": model_id, "messages": messages}
         return ModelEngineResult(
             text=f"[{model_id}] echo:{messages[-1]['content']}",
@@ -294,7 +294,7 @@ class TwoModelMissingFileReloadManager(ModelManager):
             default_model="llama3",
         )
 
-    def chat(self, model_id, messages, temperature, max_tokens):
+    def chat(self, model_id, messages, temperature, max_tokens, **kwargs):
         return ModelEngineResult(
             text=f"[{model_id}] echo:{messages[-1]['content']}",
             finish_reason="stop",
@@ -441,3 +441,4 @@ def test_switch_model_explicit_request_model_overrides_active():
     )
     assert response.status_code == 200
     assert manager.last_chat_call["model_id"] == "qwen"
+

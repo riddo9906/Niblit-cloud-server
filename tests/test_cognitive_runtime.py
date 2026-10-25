@@ -37,7 +37,7 @@ class FakeModelManager(ModelManager):
         )
         self.last_chat_call = None
 
-    def chat(self, model_id, messages, temperature, max_tokens):
+    def chat(self, model_id, messages, temperature, max_tokens, **kwargs):
         self.last_chat_call = {
             "model_id": model_id,
             "messages": messages,
@@ -859,3 +859,4 @@ class TestCognitiveAPIEndpoints:
             },
         )
         assert response.status_code == 403
+

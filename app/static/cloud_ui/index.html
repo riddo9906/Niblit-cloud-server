@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Niblit Cloud Console</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">NIBLIT CLOUD / LOCAL RUNTIME</p>
+        <h1>Inference console</h1>
+      </div>
+      <div class="status-chip"><span id="status-dot"></span><span id="status-label">Connecting</span></div>
+    </header>
+
+    <section class="status-grid" aria-label="Cloud status">
+      <div class="status-cell"><span>API</span><strong id="api-status">...</strong></div>
+      <div class="status-cell"><span>Inference</span><strong id="inference-status">...</strong></div>
+      <div class="status-cell"><span>Default model</span><strong id="default-model">...</strong></div>
+      <div class="status-cell"><span>Models</span><strong id="model-count">...</strong></div>
+    </section>
+
+    <section class="workspace">
+      <section class="chat-panel">
+        <div class="panel-head">
+          <div>
+            <span class="section-label">LIVE SESSION</span>
+            <h2 id="current-model">No model selected</h2>
+          </div>
+          <label class="model-control">Model
+            <select id="model-select" aria-label="Select model"></select>
+          </label>
+        </div>
+        <div id="messages" class="messages" aria-live="polite">
+          <div class="empty-state">Select a model and send a prompt to begin.</div>
+        </div>
+        <div id="error" class="error" role="alert" hidden></div>
+        <form id="chat-form" class="composer">
+          <textarea id="prompt" rows="3" placeholder="Ask the local runtime..." aria-label="Prompt"></textarea>
+          <div class="composer-actions">
+            <button id="clear-button" class="button quiet" type="button">Clear</button>
+            <button id="stop-button" class="button stop" type="button" disabled>Stop</button>
+            <button class="button send" type="submit">Send <span aria-hidden="true">&#8594;</span></button>
+          </div>
+        </form>
+      </section>
+
+      <aside class="details-panel">
+        <div class="panel-head compact"><div><span class="section-label">RUNTIME DETAILS</span><h2>What Cloud sees</h2></div></div>
+        <dl class="details">
+          <div><dt>Requested model</dt><dd id="requested-model">...</dd></div>
+          <div><dt>Resolved model</dt><dd id="resolved-model">...</dd></div>
+          <div><dt>Provider / backend</dt><dd id="provider-backend">...</dd></div>
+          <div><dt>Context</dt><dd id="context-limit">...</dd></div>
+          <div><dt>Residency</dt><dd id="residency">...</dd></div>
+          <div><dt>Last request</dt><dd id="request-id">...</dd></div>
+        </dl>
+        <p class="hint">Inventory and runtime values are read from the Cloud API. The console does not maintain a separate model list.</p>
+      </aside>
+    </section>
+  </main>
+  <script src="/ui/app.js" defer></script>
+</body>
+</html>
