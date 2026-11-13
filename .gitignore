@@ -69,3 +69,9 @@ Desktop.ini
 *.ckpt
 *.pem
 *.key
+
+# Local authentication material; service configuration examples remain visible.
+/.secrets/
+*.token
+*.pfx
+*.p12
