@@ -61,3 +61,11 @@ target/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local inference/training output locations
+/inference-cache/
+/training-work/
+/model-checkpoints/
+*.ckpt
+*.pem
+*.key
