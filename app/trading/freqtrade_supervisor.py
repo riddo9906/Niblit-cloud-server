@@ -171,13 +171,18 @@ class FreqtradeSupervisor:
 
     def emergency_shutdown(self) -> Dict[str, Any]:
         log.warning("[FreqtradeSupervisor] EMERGENCY SHUTDOWN")
-        self.stop_bot()
+        result = self.stop_bot()
         self.stop()
-        return {"status": "emergency_shutdown"}
+        return {**result, "monitor_stopped": True}
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _request(self, method: str, path: str, payload: Optional[dict] = None) -> Dict[str, Any]:
+        if method.upper() != "GET" or payload is not None:
+            # Existing Core tickets cover bounded enter/exit operations only.
+            # Lifecycle/config/order mutation has no transferable Core grant.
+            return {"status":"execution_blocked","reason":"core_lifecycle_authorization_unavailable",
+                    "execution_authorized":False}
         url = f"{self.base_url}{path}"
         headers = {"Content-Type": "application/json"}
         if self.username:
