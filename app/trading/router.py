@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from .models import PortfolioState, TradeProposal
 
@@ -96,22 +96,15 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.post("/trade/execute")
-def execute_trade(payload: dict[str, Any]) -> dict[str, Any]:
-    from .trade_intent import get_trade_intent_factory
+def execute_trade(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    # Generic approved/confidence/analysis envelopes are not order permission.
+    # Only an existing Core human confirmation may cross this boundary.
     from .freqtrade_adapter import get_freqtrade_adapter
-    from .models import TradeIntent
-    intent = TradeIntent(
-        symbol=payload.get("symbol", ""),
-        side=payload.get("side", "long"),
-        quantity=float(payload.get("quantity", 0)),
-        entry_price=float(payload.get("entry_price", 0)),
-        stop_loss=float(payload.get("stop_loss", 0)),
-        take_profit=float(payload.get("take_profit", 0)),
-        confidence=float(payload.get("confidence", 0.5)),
-        approved=bool(payload.get("approved", False)),
-    )
-    adapter = get_freqtrade_adapter()
-    return adapter.execute(intent)
+    if set(payload)!={"core_confirmation"}:
+        return {"status":"execution_blocked","reason":"core_human_ticket_required",
+                "execution_authorized":False}
+    return get_freqtrade_adapter().confirm_core_ticket(
+        payload["core_confirmation"],request.headers.get("x-core-desk-token",""))
 
 
 @router.get("/risk/status")

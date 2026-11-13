@@ -23,12 +23,12 @@ class FreqtradeAdapter:
         return {"status": "interface"}
 
     def start_bot(self) -> Dict[str, Any]:
-        log.info("[FreqtradeAdapter] Start bot (interface)")
-        return {"status": "interface"}
+        return {"status":"execution_blocked","reason":"core_lifecycle_authorization_unavailable",
+                "execution_authorized":False}
 
     def stop_bot(self) -> Dict[str, Any]:
-        log.info("[FreqtradeAdapter] Stop bot (interface)")
-        return {"status": "interface"}
+        return {"status":"execution_blocked","reason":"core_lifecycle_authorization_unavailable",
+                "execution_authorized":False}
 
     def get_state(self) -> Dict[str, Any]:
         return {"connected": self.connected, "bot_running": self.bot_running}

@@ -60,6 +60,41 @@ class ModelEngineResult:
     tool_calls: list[dict[str, Any]] | None = None
 
 
+def normalize_tool_calls(text, engine_tool_calls=None, tools=None):
+    if not engine_tool_calls and tools:
+        # Some local GGUF chat templates emit the tool invocation as
+        # fenced/plain JSON in content instead of native tool_calls.
+        # Promote it deterministically (only when the name matches a
+        # supplied tool) so callers get a uniform structured contract.
+        import json as _json
+        import re as _re
+        raw = (text or "").strip()
+        m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, _re.S) or (
+            _re.match(r"\{.*\}", raw, _re.S) if raw.startswith("{") else None)
+        if m:
+            try:
+                # The fenced alternative has a capturing group; the
+                # bare-JSON alternative does not (Phase 5B fix: bare
+                # content used to raise IndexError -> HTTP 500).
+                obj = _json.loads(m.group(1) if m.groups()
+                                  else m.group(0))
+                name = obj.get("name")
+                known = {t.get("function", {}).get("name") for t in tools}
+                if name in known:
+                    engine_tool_calls = [{
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": _json.dumps(obj.get("arguments", obj.get("args", {}))),
+                        },
+                    }]
+                    logger.info("Promoted text tool-call to structured: %s", name)
+            except (ValueError, AttributeError, IndexError):
+                pass
+    return engine_tool_calls
+
+
 class GGUFEngine:
     """GGUF inference engine with crash protection and diagnostics.
 
@@ -264,37 +299,7 @@ class GGUFEngine:
             message = choice.get("message") if isinstance(choice, dict) else None
             text = message.get("content") if isinstance(message, dict) else None
             engine_tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
-            if not engine_tool_calls and tools:
-                # Some local GGUF chat templates emit the tool invocation as
-                # fenced/plain JSON in content instead of native tool_calls.
-                # Promote it deterministically (only when the name matches a
-                # supplied tool) so callers get a uniform structured contract.
-                import json as _json
-                import re as _re
-                raw = (text or "").strip()
-                m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, _re.S) or (
-                    _re.match(r"\{.*\}", raw, _re.S) if raw.startswith("{") else None)
-                if m:
-                    try:
-                        # The fenced alternative has a capturing group; the
-                        # bare-JSON alternative does not (Phase 5B fix: bare
-                        # content used to raise IndexError -> HTTP 500).
-                        obj = _json.loads(m.group(1) if m.groups()
-                                          else m.group(0))
-                        name = obj.get("name")
-                        known = {t.get("function", {}).get("name") for t in tools}
-                        if name in known:
-                            engine_tool_calls = [{
-                                "id": f"call_{uuid.uuid4().hex[:8]}",
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": _json.dumps(obj.get("arguments", obj.get("args", {}))),
-                                },
-                            }]
-                            logger.info("Promoted text tool-call to structured: %s", name)
-                    except (ValueError, AttributeError, IndexError):
-                        pass
+            engine_tool_calls = normalize_tool_calls(text,engine_tool_calls,tools)
             if not isinstance(text, str) and not engine_tool_calls:
                 raise HTTPException(status_code=502, detail={"error": "invalid_response", "message": "message.content must be a string."})
             usage = response.get("usage")
@@ -467,6 +472,12 @@ class ModelManager:
         logger.info("Active model switched: %s -> %s", previous, model_id)
         return previous or ""
 
+    def _engine_type(self, model_id):
+        if os.getenv('NIBLIT_CLOUD_SHARED_GGUF','0')=='1' and model_id=='qwen2.5-coder-3b':
+            from app.shared_gguf import SharedGGUFEngine
+            return SharedGGUFEngine
+        return GGUFEngine
+
     def reload_model(self, model_id: str) -> bool:
         with self._lock:
             if model_id not in self._model_map:
@@ -475,7 +486,7 @@ class ModelManager:
         if not os.path.isfile(model_path):
             raise HTTPException(status_code=404, detail=f"Model file not found: {model_path}")
         try:
-            engine = GGUFEngine(
+            engine = self._engine_type(model_id)(
                 model_path=model_path,
                 n_ctx=self._n_ctx,
                 n_threads=self._n_threads,
@@ -519,7 +530,7 @@ class ModelManager:
         ctx_limit = self.model_context_limit(model_id)
         with self._lock:
             if model_id not in self._engines:
-                self._engines[model_id] = GGUFEngine(
+                self._engines[model_id] = self._engine_type(model_id)(
                     model_path=self._model_map[model_id],
                     n_ctx=ctx_limit,
                     n_threads=self._n_threads,
@@ -528,7 +539,7 @@ class ModelManager:
                 self._model_last_used[model_id] = time.time()
             self._model_last_used[model_id] = time.time()
             engine = self._engines[model_id]
-        plan = self._prepare_inference(messages=messages, max_tokens=max_tokens, model_id=model_id)
+        plan = self._prepare_inference(messages=messages, max_tokens=max_tokens, model_id=model_id, tools=tools)
         logger.debug(
             "chat request: model=%s messages=%d temperature=%s max_tokens=%d effective_max_tokens=%d",
             model_id, len(messages), temperature, max_tokens, plan["effective_max_tokens"],
@@ -552,8 +563,8 @@ class ModelManager:
             self._stats["last_context_usage_ratio"] = round(plan["context_usage_ratio"], 4)
         return result
 
-    def estimate_inference(self, messages: list[dict[str, str]], max_tokens: int, model_id: str | None = None) -> dict[str, Any]:
-        return self._prepare_inference(messages=messages, max_tokens=max_tokens, model_id=model_id)
+    def estimate_inference(self, messages: list[dict[str, str]], max_tokens: int, model_id: str | None = None, tools=None) -> dict[str, Any]:
+        return self._prepare_inference(messages=messages, max_tokens=max_tokens, model_id=model_id, tools=tools)
 
     def runtime_stats(self) -> dict[str, Any]:
         with self._lock:
@@ -576,7 +587,7 @@ class ModelManager:
             )
         return max(1, total_chars // self._char_to_token_ratio)
 
-    def _prepare_inference(self, messages: list[dict[str, str]], max_tokens: int, model_id: str | None = None) -> dict[str, Any]:
+    def _prepare_inference(self, messages: list[dict[str, str]], max_tokens: int, model_id: str | None = None, tools=None) -> dict[str, Any]:
         source_messages = [dict(m) for m in messages]
         safe_messages = [dict(m) for m in messages]
         requested_max_tokens = max(1, int(max_tokens))
@@ -584,13 +595,15 @@ class ModelManager:
         # a blanket global. This is the ONLY place context limits are derived.
         ctx_limit = self.model_context_limit(model_id) if model_id else self._n_ctx
         target_ctx_budget = max(256, int(ctx_limit * self._memory_guard_ratio))
-        prompt_tokens = self._estimate_tokens(safe_messages)
+        tool_tokens=self._estimate_tokens([{'role':'system','content':json.dumps(tools,ensure_ascii=False)}])+256 if tools else 0
+        prompt_tokens = self._estimate_tokens(safe_messages)+tool_tokens
         min_generation = max(16, min(self._min_generation_tokens, requested_max_tokens))
         max_prompt_budget = max(64, target_ctx_budget - max(self._context_reserve_tokens, min_generation))
+        if tool_tokens+64>max_prompt_budget:raise HTTPException(413,'Tool schemas exceed the selected model context; choose a narrower registered tool set or larger context')
         messages_truncated = False
         if prompt_tokens > max_prompt_budget and safe_messages:
             kept: list[dict[str, str]] = []
-            running_tokens = 0
+            running_tokens = tool_tokens
             for msg in reversed(safe_messages):
                 msg_tokens = self._estimate_tokens([msg])
                 if kept and (running_tokens + msg_tokens) > max_prompt_budget:
@@ -602,15 +615,15 @@ class ModelManager:
                     break
             safe_messages = list(reversed(kept)) or [source_messages[-1]]
             if safe_messages:
-                prompt_tokens = self._estimate_tokens(safe_messages)
+                prompt_tokens = self._estimate_tokens(safe_messages)+tool_tokens
             if prompt_tokens > max_prompt_budget and safe_messages:
                 last = dict(safe_messages[-1])
-                max_chars = max(64, max_prompt_budget * self._char_to_token_ratio)
+                max_chars = max(64, (max_prompt_budget-tool_tokens) * self._char_to_token_ratio)
                 if len(last.get("content", "")) > max_chars:
                     last["content"] = last["content"][-max_chars:]
                     safe_messages[-1] = last
                     messages_truncated = True
-                prompt_tokens = self._estimate_tokens(safe_messages)
+                prompt_tokens = self._estimate_tokens(safe_messages)+tool_tokens
         available_for_generation = max(1, target_ctx_budget - prompt_tokens - self._context_reserve_tokens)
         effective_max_tokens = max(1, min(requested_max_tokens, available_for_generation))
         context_usage_ratio = (prompt_tokens + effective_max_tokens) / max(1, ctx_limit)
@@ -719,6 +732,7 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
         models = config.model_map
         default_model = config.default_model
         _manager = ModelManager(models, default_model, config=config)
+    models = {entry["id"]: "" for entry in _manager.list_models()}
     _model_registry = _try_import_model_registry()
 
     _event_bus_mod   = _try_import("app.event_bus")
@@ -754,6 +768,13 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
         description="Niblit Cloud Server — inference layer. Backward compatible with OpenAI, HF, llama.cpp.",
         lifespan=lifespan,
     )
+    from app.shared_gguf import delegated_token
+    @app.middleware('http')
+    async def task_delegation_context(request, call_next):
+        marker=delegated_token.set(request.headers.get('x-niblit-task-token'))
+        try:return await call_next(request)
+        finally:delegated_token.reset(marker)
+
     app.state.model_manager = _manager
     app.state.cloud_config = config
     _cursor_gateway = get_cursor_gateway()
@@ -973,7 +994,7 @@ def create_app(model_manager: Any | None = None, config: Any | None = None) -> F
             resolved_model = resolver(payload.model or path_model, path_model)
         logger.debug("preflight[%s] resolved model=%s", request_id, resolved_model)
         inference_plan = manager.estimate_inference(
-            messages=messages, max_tokens=payload.max_tokens, model_id=resolved_model
+            messages=messages, max_tokens=payload.max_tokens, model_id=resolved_model, **({"tools":payload.tools} if payload.tools else {})
         )
         logger.debug("preflight[%s] estimated prompt=%s", request_id, inference_plan["prompt_tokens_estimate"])
         envelope = _extract_envelope(payload)

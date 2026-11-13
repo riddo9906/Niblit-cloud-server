@@ -328,8 +328,9 @@ class TestFreqtradeAdapter:
             confidence=0.8, approved=True,
         )
         result = adapter.execute(intent)
-        assert result["status"] == "logged"
-        assert result["simulated"] is True
+        assert result["status"] == "execution_blocked"
+        assert result["execution_authorized"] is False
+        assert "trade_id" not in result
 
     def test_status(self):
         from app.trading.freqtrade_adapter import get_freqtrade_adapter

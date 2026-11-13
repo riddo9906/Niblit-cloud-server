@@ -15,7 +15,6 @@ import logging
 import os
 import threading
 import time
-import uuid
 from typing import Any, Callable
 
 from .models import ExecutionResult, TradeIntent
@@ -59,45 +58,78 @@ class FreqtradeAdapter:
         self._subscribers.append(callback)
 
     def execute(self, intent: TradeIntent) -> dict[str, Any]:
-        """Execute a TradeIntent through Freqtrade.
+        """Legacy proposals are analysis, never transferable Core approval."""
+        return {"status":"execution_blocked", "reason":"core_human_ticket_required",
+                "execution_authorized":False}
 
-        Returns execution response dict with status and trade_id.
+    def confirm_core_ticket(self, confirmation, desk_token):
+        """Delegate an existing human ticket to its Core owner, never a broker.
+
+        No approval issuer, ticket minting, broker credentials, cache or retry is
+        provided. Core atomically verifies binding, expiry, account/mode, risk,
+        current human consent and durable idempotency before any submission.
         """
+        def blocked(reason):
+            return {"status":"execution_blocked","reason":reason,"execution_authorized":False}
         if not self._enabled:
-            logger.info("Freqtrade disabled — trade %s/%s logged only", intent.symbol, intent.side)
-            return {"status": "logged", "trade_id": f"dry-{uuid.uuid4().hex[:12]}", "simulated": True}
-
-        if not intent.approved:
-            logger.warning("Rejected unapproved trade: %s/%s", intent.symbol, intent.side)
-            return {"status": "rejected", "reason": "not_approved"}
-
-        # Build Freqtrade RPC payload
-        payload = {
-            "method": "forcebuy" if intent.side == "long" else "forcesell",
-            "pair": intent.symbol,
-            "side": intent.side,
-            "amount": intent.quantity,
-            "limit": intent.entry_price,
-            "stoploss": intent.stop_loss,
-            "takeprofit": intent.take_profit,
-        }
+            return blocked("cloud_execution_disabled")
+        try:
+            # Freeze the request before checking/sending; reject non-JSON/NaN.
+            confirmation=json.loads(json.dumps(confirmation,allow_nan=False))
+            if not isinstance(confirmation,dict) or set(confirmation)!={
+                    "ticket","acknowledgement","mode","intent","identity"}:
+                return blocked("malformed_core_confirmation")
+            if (confirmation["mode"]!="dry-run" or
+                    not isinstance(confirmation["identity"],dict) or
+                    confirmation["identity"].get("dry_run") is not True):
+                return blocked("explicit_non_live_mode_required")
+            intent=confirmation["intent"]
+            if (not isinstance(intent,dict) or intent.get("action") not in ("enter_long","exit")
+                    or not isinstance(intent.get("pair"),str)):
+                return blocked("unsupported_core_operation")
+            if confirmation["acknowledgement"]!="CONFIRM_SIMULATED_ORDER":
+                return blocked("human_acknowledgement_required")
+            import re
+            if (not isinstance(confirmation["ticket"],str)
+                    or re.fullmatch(r"[A-Za-z0-9_-]{32}",confirmation["ticket"]) is None
+                    or not isinstance(desk_token,str)
+                    or re.fullmatch(r"[A-Za-z0-9_-]{32,128}",desk_token) is None):
+                return blocked("core_human_authorization_required")
+        except (TypeError,ValueError):
+            return blocked("malformed_core_confirmation")
 
         try:
-            import requests
-            response = requests.post(
-                f"{self._freqtrade_url}/api/v1/forceentry",
-                json=payload,
-                auth=(self._freqtrade_username, self._freqtrade_password)
-                if self._freqtrade_username else None,
-                timeout=30,
-            )
-            result = response.json()
-            trade_id = result.get("trade_id", f"ft-{uuid.uuid4().hex[:12]}")
-            logger.info("Trade executed via Freqtrade: %s/%s id=%s", intent.symbol, intent.side, trade_id)
-            return {"status": "executed", "trade_id": trade_id, "response": result}
+            import httpx
+            # Fixed existing Core-owned human gateway. Never follow redirects or
+            # environment proxies with the human capability header.
+            port=int(os.getenv("NIBLIT_API_PORT","5000"))
+            if not 1 <= port <= 65535:
+                return blocked("core_endpoint_unverifiable")
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}",trust_env=False,
+                              follow_redirects=False,timeout=httpx.Timeout(20,connect=2)) as client:
+                response=client.post("/api/trading/cloud/confirm",json=confirmation,headers={
+                    "x-core-desk-token":desk_token})
+            if 400 <= response.status_code < 500:
+                return blocked("core_denied_or_unverifiable")
+            # Redirects, 5xx, bad JSON and transport errors are never accepted
+            # and never automatically resent. Delivery may already have begun.
+            if response.status_code!=200:
+                return {"status":"unknown","reason":"core_confirmation_unverified",
+                        "execution_authorized":False,"retry_allowed":False}
+            body=response.json()
+            if body.get("mode")!="dry-run" or body.get("authority")!="core_human_ticket":
+                raise ValueError("Unverified Core confirmation")
+            state=body.get("state")
+            if state in ("submitted","reconciled"):
+                return {"status":state,"core_receipt":body,"execution_authorized":True,
+                        "notice":"Core submission evidence; not proof of a broker fill."}
+            if state in ("rejected","revoked","denied"):
+                return blocked("core_rejected")
+            return {"status":"unknown","core_receipt":body,
+                    "execution_authorized":False,"retry_allowed":False}
         except Exception as exc:
-            logger.error("Freqtrade execution failed: %s", exc)
-            return {"status": "failed", "error": str(exc)}
+            return {"status":"unknown","reason":"core_unavailable_or_delivery_uncertain",
+                    "error_type":type(exc).__name__,"execution_authorized":False,"retry_allowed":False}
 
     def sync_open_trades(self) -> list[dict[str, Any]]:
         """Sync open trades from Freqtrade."""
