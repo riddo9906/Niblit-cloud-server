@@ -37,7 +37,7 @@ class QwenServerProvider:
         self.model_path = self.model_path or os.getenv("NIBLIT_MODEL_PATH", "")
         self.backend_bin = self.backend_bin or os.getenv("NIBLIT_LLAMA_SERVER_BIN", "")
         self.host = os.getenv("NIBLIT_HOST", "127.0.0.1")
-        self.port = int(os.getenv("NIBLIT_PORT", "8000"))
+        self.port = int(os.getenv("NIBLIT_QWEN_PORT", str(self.port)))
         self.n_ctx = int(os.getenv("NIBLIT_N_CTX", "32768"))
         self.n_threads = int(os.getenv("NIBLIT_N_THREADS", "8"))
         self.n_gpu_layers = int(os.getenv("NIBLIT_N_GPU_LAYERS", "35"))
@@ -49,6 +49,9 @@ class QwenServerProvider:
         if not self.backend_bin or not os.path.isfile(self.backend_bin):
             logger.warning("QwenServerProvider: backend binary not found at %s", self.backend_bin)
             return False
+
+        if os.name == 'nt':
+            return self._start_native_windows()
 
         script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         tools_dir = os.path.join(script_dir, "tools")
@@ -98,6 +101,78 @@ class QwenServerProvider:
             self.process = None
             return False
 
+    def _start_native_windows(self, profile_override=None) -> bool:
+        """Use the installed llama.cpp directly; no bash, downloads or shell."""
+        import hashlib,json,socket
+        from pathlib import Path
+        import httpx
+        profile_path=profile_override or os.environ.get('NIBLIT_ACTIVE_MODEL_PROFILE','')
+        if not profile_path:
+            logger.warning('Native Windows provider requires an explicit versioned profile')
+            return False
+        try:
+            raw=Path(profile_path).read_bytes()
+            if len(raw)>65536:raise ValueError('Model profile too large')
+            profile=json.loads(raw)
+            if profile.get('schema_version')!='niblit-local-model/1' or profile.get('architecture')!='qwen2':
+                raise ValueError('Unsupported model architecture/profile')
+            if profile.get('tokenizer')!='embedded-gguf' or profile.get('model_id')!='qwen2.5-coder-3b':
+                raise ValueError('Incompatible tokenizer/model identity')
+            version=profile.get('version')
+            if not isinstance(version,str) or not version or len(version)>80:raise ValueError('Versioned model profile required')
+            settings=profile.get('runtime',{})
+            ctx=settings.get('context_length',self.n_ctx)
+            threads=settings.get('threads',self.n_threads)
+            gpu=settings.get('gpu_layers',self.n_gpu_layers)
+            if any(isinstance(v,bool) or not isinstance(v,int) for v in (ctx,threads,gpu)):
+                raise ValueError('Explicit integer runtime settings required')
+            if not 1024<=ctx<=32768 or not 1<=threads<=max(1,os.cpu_count() or 1) or gpu!=0:
+                raise ValueError('Unsupported local runtime/resource profile')
+            self.n_ctx,self.n_threads,self.n_gpu_layers=ctx,threads,gpu
+            self.profile_version=version
+            for key,path in (('executable',self.backend_bin),('model',self.model_path)):
+                if str(Path(path).resolve())!=str(Path(profile[key]['path']).resolve()):
+                    raise ValueError('Model or runtime profile binding mismatch')
+                with open(path,'rb') as stream:actual=hashlib.file_digest(stream,'sha256').hexdigest()
+                if actual!=profile[key]['sha256']:raise ValueError('Model/runtime integrity mismatch')
+            with open(self.model_path,'rb') as stream:
+                if stream.read(4)!=b'GGUF':raise ValueError('GGUF model required')
+            if self.host!='127.0.0.1' or not 1024<=self.port<=65535:raise ValueError('Loopback provider required')
+            with socket.socket() as probe:
+                if probe.connect_ex((self.host,self.port))==0:raise ValueError('Inference port already owned')
+            keyfile=os.environ.get('NIBLIT_PORTAL_GGUF_KEY_FILE','')
+            if not keyfile or len(Path(keyfile).read_text().strip())<32:raise ValueError('Native authentication required')
+            logs=Path(os.environ.get('NIBLIT_SERVICE_LOG_DIR',os.environ.get('TMPDIR','.')))
+            logs.mkdir(parents=True,exist_ok=True);self.log_file=str(logs/'llama-server.log')
+            cmd=[self.backend_bin,'-m',self.model_path,'--host',self.host,'--port',str(self.port),
+                 '--ctx-size',str(self.n_ctx),'--threads',str(self.n_threads),
+                 '--n-gpu-layers',str(self.n_gpu_layers),'--parallel','1','--alias',profile['model_id'],
+                 '--api-key-file',keyfile]
+            with open(self.log_file,'ab') as log:
+                self.process=subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),shell=False)
+            deadline=time.monotonic()+120
+            headers={'Authorization':'Bearer '+Path(keyfile).read_text().strip()}
+            with httpx.Client(trust_env=False,timeout=2) as client:
+                while time.monotonic()<deadline:
+                    if self.process.poll() is not None:raise RuntimeError('Native provider exited before readiness')
+                    try:
+                        r=client.get(f'http://127.0.0.1:{self.port}/v1/models',headers=headers)
+                        if r.status_code==200 and any(m.get('id')==profile['model_id'] for m in r.json().get('data',[])):
+                            self.ready=True
+                            return True
+                    except httpx.HTTPError:pass
+                    time.sleep(.25)
+            raise TimeoutError('Native inference readiness timed out')
+        except Exception as exc:
+            logger.error('Native Windows provider unavailable: %s',type(exc).__name__)
+            self.stop()
+            fallback=os.environ.get('NIBLIT_FALLBACK_MODEL_PROFILE','')
+            if profile_override is None and fallback and fallback!=profile_path:
+                logger.warning('Experimental profile rejected; retaining configured known-good Qwen fallback')
+                return self._start_native_windows(fallback)
+            return False
+
     def stop(self) -> None:
         """Stop the qwen server backend."""
         if self.process is None:
@@ -140,6 +215,8 @@ class QwenServerProvider:
             "port": self.port,
             "model_path": self.model_path,
             "backend_bin": self.backend_bin,
+            "profile_version": getattr(self,"profile_version",None),
+            "context_length":self.n_ctx,
         }
 
 

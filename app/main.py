@@ -2147,7 +2147,19 @@ def _run_cli() -> None:
     host = cfg.host
     port = cfg.port
     logger.info("Launching uvicorn on %s:%d", host, port)
-    uvicorn.run(app, host=host, port=port, log_config=None)
+    owned_server=uvicorn.Server(uvicorn.Config(app,host=host,port=port,log_config=None))
+    if os.environ.get('NIBLIT_SERVICE_CONTROL_KEY_FILE'):
+        @app.post('/internal/desktop/shutdown')
+        async def desktop_owned_shutdown(request: Request):
+            import secrets
+            from pathlib import Path
+            key=Path(os.environ['NIBLIT_SERVICE_CONTROL_KEY_FILE']).read_text().strip()
+            if (request.client is None or request.client.host!='127.0.0.1' or len(key)<32
+                    or not secrets.compare_digest(request.headers.get('x-niblit-service-key',''),key)):
+                raise HTTPException(status_code=403,detail='Owned desktop lifecycle credential required')
+            owned_server.should_exit=True
+            return {'shutdown_requested':True,'owner_pid':os.getpid()}
+    owned_server.run()
 
 
 def main() -> None:
